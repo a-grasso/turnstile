@@ -1,0 +1,21 @@
+# turnstile - checks that must pass before a push leaves this repo.
+#
+#   <name>: <shell command>
+#
+# Run from the repo root. Non-zero exit refuses the push.
+# Delete this file and the repo passes straight through.
+#
+# Keep these fast. A gate that takes two minutes is a gate you will start
+# bypassing, and a bypassed gate is worse than no gate - it costs time AND
+# trains you to ignore it.
+
+lint: make lint
+test: go test ./...
+
+# Available to each command, so checks can scope themselves to the push
+# instead of walking the whole repo:
+#
+#   TURNSTILE_RANGE          e.g. abc123..def456
+#   TURNSTILE_CHANGED_FILES  newline-separated paths in that range
+#
+# changed-tests: go test $(echo "$TURNSTILE_CHANGED_FILES" | xargs -n1 dirname | sort -u)

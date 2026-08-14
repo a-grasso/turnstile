@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# turnstile git hook dispatcher.
+#
+# Symlinked into ~/.turnstile/hooks/ once per client-side hook name and pointed
+# at by a global core.hooksPath. Two jobs:
+#
+#   1. For pre-push, run turnstile's gate.
+#   2. For EVERY hook, delegate to the repo's own .git/hooks/<name>.
+#
+# (2) is not politeness. A global core.hooksPath replaces .git/hooks wholesale,
+# so without delegation, installing turnstile would silently disable every
+# existing hook in every repo on the machine.
+
+set -uo pipefail
+
+hook_name="$(basename "$0")"
+
+# Re-entrancy guard. A hook that re-enters itself does not fail, it fork-bombs
+# the machine, so this is cheap insurance on top of the -ef check below.
+guard="TURNSTILE_IN_${hook_name//-/_}"
+if [ -n "${!guard:-}" ]; then
+  exit 0
+fi
+export "$guard=1"
+
+_resolve_self() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+TURNSTILE_BIN="$(dirname "$(_resolve_self)")/bin/turnstile"
+
+# pre-push receives ref updates on stdin; both turnstile and any delegated hook
+# need to read the same bytes, so capture once and replay.
+# NB: $(...) strips trailing newlines, so the replays below re-add one. Without
+# it the final ref line arrives unterminated, `read` reports EOF, and the gate
+# silently validates nothing while reporting success - the worst failure mode
+# this tool has.
+stdin_data=""
+if [ "$hook_name" = "pre-push" ]; then
+  stdin_data="$(cat)"
+fi
+
+# --- 1. turnstile's own gate -------------------------------------------------
+
+if [ "$hook_name" = "pre-push" ] && [ -x "$TURNSTILE_BIN" ]; then
+  printf '%s' "$stdin_data" | "$TURNSTILE_BIN" __pre-push "$@" || exit $?
+fi
+
+# --- 2. delegate to the repo's own hook --------------------------------------
+
+# NOT `git rev-parse --git-path hooks`: that returns core.hooksPath when it is
+# set, which is this directory - the dispatcher would delegate to itself and
+# fork-bomb. --git-common-dir gives the real git dir (and follows worktrees and
+# submodules, where .git is a file rather than a directory).
+if git_dir="$(git rev-parse --git-common-dir 2>/dev/null)"; then
+  case "$git_dir" in
+    /*) ;;
+    *)  git_dir="$(git rev-parse --show-toplevel)/$git_dir" ;;
+  esac
+
+  local_hook="$git_dir/hooks/$hook_name"
+
+  # Belt and braces: never exec something that is this same file, however the
+  # path was arrived at. `-ef` compares device+inode, so it sees through
+  # symlinks and relative paths.
+  if [ -x "$local_hook" ] && ! [ "$local_hook" -ef "${BASH_SOURCE[0]}" ]; then
+    if [ "$hook_name" = "pre-push" ]; then
+      printf '%s\n' "$stdin_data" |"$local_hook" "$@"
+    else
+      "$local_hook" "$@"
+    fi
+    exit $?
+  fi
+fi
+
+exit 0

@@ -1,0 +1,447 @@
+#!/usr/bin/env bash
+# turnstile - a mechanical gate on the push path.
+#
+# Not a skill, not an agent. A git pre-push hook that runs a repo's own
+# deterministic checks and refuses the push if they fail. Fires because the
+# code path was taken, not because a model decided it was relevant.
+#
+# See README.md for the design and the install story.
+
+set -uo pipefail
+
+TURNSTILE_VERSION="0.1.0-prototype"
+
+# ---------------------------------------------------------------- paths
+
+# Resolve this script's real location without relying on `readlink -f`.
+_resolve_self() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+TURNSTILE_BIN="$(_resolve_self)"
+TURNSTILE_HOME="$(dirname "$TURNSTILE_BIN")"
+export TURNSTILE_HOME
+
+HOOKS_INSTALL_DIR="${TURNSTILE_HOOKS_DIR:-$HOME/.turnstile/hooks}"
+
+# Client-side hooks the dispatcher must shadow once core.hooksPath is global.
+# Anything not listed here stops firing for every repo, so the list is the
+# contract - not a convenience.
+GIT_HOOKS=(
+  applypatch-msg pre-applypatch post-applypatch
+  pre-commit pre-merge-commit prepare-commit-msg commit-msg post-commit
+  pre-rebase post-checkout post-merge pre-push
+  post-rewrite pre-auto-gc push-to-checkout sendemail-validate
+)
+
+# ---------------------------------------------------------------- output
+
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  CLEAR_LINE=$'\r\033[K'
+else
+  C_RESET=''; C_DIM=''; C_BOLD=''; C_RED=''; C_GREEN=''; C_YELLOW=''
+  # Redirected output gets no in-progress line to erase, so nothing to clear -
+  # emitting the escape anyway litters CI logs with stray [K.
+  CLEAR_LINE=''
+fi
+
+say()  { printf '%s\n' "$*" >&2; }
+dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET" >&2; }
+warn() { printf '%s! %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
+die()  { printf '%sx %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+
+# ---------------------------------------------------------------- config
+
+CONFIG_NAME=".turnstile"
+
+repo_root() { git rev-parse --show-toplevel 2>/dev/null; }
+
+config_path() {
+  local root; root="$(repo_root)" || return 1
+  [ -n "$root" ] && printf '%s/%s' "$root" "$CONFIG_NAME"
+}
+
+# Emits "name<TAB>command" per configured check.
+#
+# Format is deliberately line-oriented rather than YAML/TOML: no parser
+# dependency, and a config that cannot express anything but a list of commands
+# cannot grow into a second configuration language.
+#
+#   # comment
+#   lint: make lint
+#   test: go test ./...
+read_checks() {
+  local cfg; cfg="$(config_path)" || return 1
+  [ -f "$cfg" ] || return 1
+  # shellcheck disable=SC2162
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"          # ltrim
+    [ -z "$line" ] && continue
+    case "$line" in \#*) continue ;; esac
+    case "$line" in *:*) ;; *) continue ;; esac
+    local name="${line%%:*}" cmd="${line#*:}"
+    name="${name%"${name##*[![:space:]]}"}"          # rtrim
+    cmd="${cmd#"${cmd%%[![:space:]]*}"}"             # ltrim
+    [ -z "$cmd" ] && continue
+    printf '%s\t%s\n' "$name" "$cmd"
+  done < "$cfg"
+}
+
+# ---------------------------------------------------------------- push range
+
+ZERO="0000000000000000000000000000000000000000"
+
+# Reads pre-push stdin ("<local ref> <local sha> <remote ref> <remote sha>")
+# and exports the range being pushed, so checks can scope themselves to the
+# change instead of walking the whole repo.
+#
+# Sets: TURNSTILE_RANGE, TURNSTILE_LOCAL_SHA, TURNSTILE_REMOTE_SHA,
+#       TURNSTILE_CHANGED_FILES (newline separated)
+# Returns 1 when there is nothing to gate (branch deletion, or no refs at all).
+compute_range() {
+  local local_ref local_sha remote_ref remote_sha
+  local have_range=1
+
+  # `|| [ -n "$local_ref" ]` so an unterminated final line is still processed
+  # rather than being dropped at EOF.
+  while read -r local_ref local_sha remote_ref remote_sha || [ -n "${local_ref:-}" ]; do
+    [ -z "${local_sha:-}" ] && continue
+    # Deleting a remote branch pushes no content - nothing to validate.
+    [ "$local_sha" = "$ZERO" ] && continue
+
+    if [ "$remote_sha" = "$ZERO" ] || [ -z "$remote_sha" ]; then
+      # New remote branch: diff against the default branch when we can find
+      # it, otherwise fall back to the last commit rather than the repo root.
+      local base; base="$(default_base "$local_sha")"
+      TURNSTILE_RANGE="${base}..${local_sha}"
+    else
+      TURNSTILE_RANGE="${remote_sha}..${local_sha}"
+    fi
+    TURNSTILE_LOCAL_SHA="$local_sha"
+    TURNSTILE_REMOTE_SHA="$remote_sha"
+    have_range=0
+    break   # prototype: gate the first content-bearing ref, not each one
+  done
+
+  [ "$have_range" -eq 0 ] || return 1
+
+  TURNSTILE_CHANGED_FILES="$(git diff --name-only "$TURNSTILE_RANGE" 2>/dev/null)"
+  export TURNSTILE_RANGE TURNSTILE_LOCAL_SHA TURNSTILE_REMOTE_SHA TURNSTILE_CHANGED_FILES
+  return 0
+}
+
+default_base() {
+  local head="$1" b sha head_sha
+  head_sha="$(git rev-parse --verify --quiet "$head" 2>/dev/null)"
+  for b in origin/HEAD origin/main origin/master main master; do
+    sha="$(git rev-parse --verify --quiet "$b" 2>/dev/null)" || continue
+    # Must be a *strict* ancestor. A base that resolves to HEAD itself (pushing
+    # `main` for the first time, say) yields an empty range and a gate that
+    # silently checks nothing.
+    [ "$sha" = "$head_sha" ] && continue
+    git merge-base --is-ancestor "$b" "$head" 2>/dev/null || continue
+    printf '%s' "$b"; return 0
+  done
+  # Nothing usable: diff against git's empty tree so a first push is checked in
+  # full. Using the root commit instead would silently drop every file the root
+  # commit introduced.
+  printf '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+}
+
+# ---------------------------------------------------------------- run checks
+
+# Runs every configured check, buffering output and surfacing it only on
+# failure. Returns the number of failures.
+run_checks() {
+  local label="${1:-turnstile}"
+  local -a names=() cmds=()
+  local line name cmd
+
+  while IFS=$'\t' read -r name cmd; do
+    names+=("$name"); cmds+=("$cmd")
+  done < <(read_checks)
+
+  if [ "${#names[@]}" -eq 0 ]; then
+    dim "turnstile: no $CONFIG_NAME checks in $(repo_root) - passing through"
+    return 0
+  fi
+
+  say ""
+  say "${C_BOLD}turnstile${C_RESET} ${C_DIM}${label}${C_RESET}"
+  [ -n "${TURNSTILE_RANGE:-}" ] && dim "  range ${TURNSTILE_RANGE}"
+
+  local failures=0 i out rc start elapsed
+  local logdir; logdir="$(mktemp -d "${TMPDIR:-/tmp}/turnstile.XXXXXX")"
+
+  for i in "${!names[@]}"; do
+    name="${names[$i]}"; cmd="${cmds[$i]}"
+    out="$logdir/$i.log"
+    start=$SECONDS
+
+    [ -n "$CLEAR_LINE" ] && printf '  %s… %s%s' "$C_DIM" "$name" "$C_RESET" >&2
+    # Checks must not inherit the hook's stdin (the ref list); one `read` in a
+    # check script would otherwise hang the push.
+    ( cd "$(repo_root)" && eval "$cmd" ) >"$out" 2>&1 </dev/null
+    rc=$?
+    elapsed=$((SECONDS - start))
+
+    printf '%s' "$CLEAR_LINE" >&2
+    if [ $rc -eq 0 ]; then
+      printf '  %s✓%s %s %s(%ss)%s\n' "$C_GREEN" "$C_RESET" "$name" "$C_DIM" "$elapsed" "$C_RESET" >&2
+    else
+      printf '  %s✗%s %s %s(exit %s, %ss)%s\n' "$C_RED" "$C_RESET" "$name" "$C_DIM" "$rc" "$elapsed" "$C_RESET" >&2
+      failures=$((failures + 1))
+      say ""
+      dim "    \$ $cmd"
+      # Tail rather than the whole log: the failure is nearly always at the end,
+      # and a 5000-line test dump in a hook is how people learn to --no-verify.
+      sed -e 's/^/    /' <(tail -n 40 "$out") >&2
+      say ""
+    fi
+  done
+
+  rm -rf "$logdir"
+  return $failures
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_pre_push() {
+  if [ -n "${TURNSTILE_SKIP:-}" ]; then
+    warn "turnstile: skipped via TURNSTILE_SKIP"
+    return 0
+  fi
+
+  if ! compute_range; then
+    dim "turnstile: nothing to validate (deletion or empty push)"
+    return 0
+  fi
+
+  run_checks "pre-push → ${1:-remote}"
+  local failures=$?
+
+  if [ "$failures" -gt 0 ]; then
+    say ""
+    say "${C_RED}${C_BOLD}push refused${C_RESET} - $failures check(s) failed"
+    dim "  fix them, or bypass deliberately:  git push --no-verify"
+    say ""
+    return 1
+  fi
+
+  say ""
+  return 0
+}
+
+cmd_run() {
+  local root; root="$(repo_root)" || die "not inside a git repository"
+
+  # Approximate what a push would validate, so this is the same gate you can
+  # run by hand without pushing.
+  local upstream
+  if upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"; then
+    TURNSTILE_RANGE="${upstream}..HEAD"
+  else
+    TURNSTILE_RANGE="$(default_base HEAD)..HEAD"
+  fi
+  TURNSTILE_CHANGED_FILES="$(git diff --name-only "$TURNSTILE_RANGE" 2>/dev/null)"
+  export TURNSTILE_RANGE TURNSTILE_CHANGED_FILES
+
+  run_checks "manual run"
+  local failures=$?
+  say ""
+  if [ "$failures" -gt 0 ]; then
+    say "  ${C_RED}${C_BOLD}$failures check(s) failed${C_RESET} - this push would be refused"
+    say ""
+    return 1
+  fi
+  say "  ${C_GREEN}${C_BOLD}all checks passed${C_RESET}"
+  say ""
+  return 0
+}
+
+cmd_install() {
+  local dispatch="$TURNSTILE_HOME/hooks/dispatch"
+  [ -x "$dispatch" ] || die "missing or non-executable: $dispatch"
+
+  local existing
+  existing="$(git config --global --get core.hooksPath || true)"
+  if [ -n "$existing" ] && [ "$existing" != "$HOOKS_INSTALL_DIR" ]; then
+    die "global core.hooksPath is already set to '$existing'.
+    turnstile would replace it. Resolve that first (or point turnstile's
+    dispatcher at it) - silently taking over another tool's hooks is exactly
+    the kind of trapdoor this tool is supposed to not be."
+  fi
+
+  mkdir -p "$HOOKS_INSTALL_DIR"
+  local h
+  for h in "${GIT_HOOKS[@]}"; do
+    ln -sf "$dispatch" "$HOOKS_INSTALL_DIR/$h"
+  done
+
+  git config --global core.hooksPath "$HOOKS_INSTALL_DIR"
+
+  say ""
+  say "  ${C_GREEN}✓${C_RESET} turnstile installed"
+  say ""
+  dim "    dispatcher  $dispatch"
+  dim "    hooks       $HOOKS_INSTALL_DIR  (${#GIT_HOOKS[@]} symlinks)"
+  dim "    git config  core.hooksPath (global)"
+  say ""
+  say "  Add a ${C_BOLD}.turnstile${C_RESET} file to any repo you want gated:"
+  say ""
+  dim "    lint: make lint"
+  dim "    test: go test ./..."
+  say ""
+  say "  Repos without one pass straight through."
+  say ""
+}
+
+cmd_uninstall() {
+  local current
+  current="$(git config --global --get core.hooksPath || true)"
+  if [ "$current" = "$HOOKS_INSTALL_DIR" ]; then
+    git config --global --unset core.hooksPath
+    say "  ${C_GREEN}✓${C_RESET} unset global core.hooksPath"
+  else
+    warn "global core.hooksPath is '$current' - leaving it alone"
+  fi
+  if [ -d "$HOOKS_INSTALL_DIR" ]; then
+    rm -rf "$HOOKS_INSTALL_DIR"
+    say "  ${C_GREEN}✓${C_RESET} removed $HOOKS_INSTALL_DIR"
+  fi
+}
+
+cmd_status() {
+  say ""
+  say "  ${C_BOLD}turnstile${C_RESET} $TURNSTILE_VERSION"
+  say ""
+
+  local global_path repo_path root cfg
+  global_path="$(git config --global --get core.hooksPath || true)"
+  root="$(repo_root || true)"
+
+  if [ "$global_path" = "$HOOKS_INSTALL_DIR" ]; then
+    say "  global      ${C_GREEN}installed${C_RESET}  ($HOOKS_INSTALL_DIR)"
+  elif [ -n "$global_path" ]; then
+    say "  global      ${C_YELLOW}not installed${C_RESET}  (core.hooksPath = $global_path)"
+  else
+    say "  global      ${C_YELLOW}not installed${C_RESET}"
+  fi
+
+  if [ -z "$root" ]; then
+    say "  repo        (not inside a git repository)"
+    say ""
+    return 0
+  fi
+
+  say "  repo        $root"
+
+  # A repo-local core.hooksPath (husky, lefthook) wins over the global one, so
+  # turnstile is usually not in the path there. Usually - not always: check
+  # whether that directory's pre-push is in fact our dispatcher before claiming
+  # we are absent. Reporting no coverage when there is some is as much a lie as
+  # the reverse.
+  repo_path="$(git -C "$root" config --local --get core.hooksPath || true)"
+  if [ -n "$repo_path" ]; then
+    case "$repo_path" in /*) ;; *) repo_path="$root/$repo_path" ;; esac
+    if [ "$repo_path/pre-push" -ef "$TURNSTILE_HOME/hooks/dispatch" ]; then
+      say "  gate        ${C_GREEN}active here${C_RESET}  (repo-local core.hooksPath → turnstile)"
+    else
+      say "  ${C_YELLOW}override${C_RESET}    repo sets core.hooksPath = $repo_path"
+      say "              turnstile does NOT run in this repo"
+    fi
+  fi
+
+  cfg="$(config_path)"
+  if [ -f "$cfg" ]; then
+    say "  checks"
+    local name cmd
+    while IFS=$'\t' read -r name cmd; do
+      printf '                %s%-10s%s %s\n' "$C_BOLD" "$name" "$C_RESET" "$cmd" >&2
+    done < <(read_checks)
+  else
+    say "  checks      ${C_DIM}none (no $CONFIG_NAME file - pushes pass through)${C_RESET}"
+  fi
+  say ""
+}
+
+cmd_doctor() {
+  local problems=0
+  say ""
+  say "  ${C_BOLD}turnstile doctor${C_RESET}"
+  say ""
+
+  local dispatch="$TURNSTILE_HOME/hooks/dispatch"
+  if [ -x "$dispatch" ]; then
+    say "  ${C_GREEN}✓${C_RESET} dispatcher executable"
+  else
+    say "  ${C_RED}✗${C_RESET} dispatcher missing or not executable: $dispatch"
+    problems=$((problems + 1))
+  fi
+
+  local global_path; global_path="$(git config --global --get core.hooksPath || true)"
+  if [ "$global_path" = "$HOOKS_INSTALL_DIR" ]; then
+    say "  ${C_GREEN}✓${C_RESET} global core.hooksPath points at turnstile"
+  else
+    say "  ${C_RED}✗${C_RESET} global core.hooksPath is '${global_path:-unset}' - run: turnstile install"
+    problems=$((problems + 1))
+  fi
+
+  local h missing=0
+  for h in "${GIT_HOOKS[@]}"; do
+    [ -L "$HOOKS_INSTALL_DIR/$h" ] || missing=$((missing + 1))
+  done
+  if [ "$missing" -eq 0 ]; then
+    say "  ${C_GREEN}✓${C_RESET} all ${#GIT_HOOKS[@]} hook symlinks present"
+  else
+    say "  ${C_RED}✗${C_RESET} $missing hook symlink(s) missing - repo-local hooks would stop firing"
+    problems=$((problems + 1))
+  fi
+
+  say ""
+  [ "$problems" -eq 0 ] && say "  no problems found" || say "  $problems problem(s)"
+  say ""
+  [ "$problems" -eq 0 ]
+}
+
+usage() {
+  cat >&2 <<EOF
+
+  ${C_BOLD}turnstile${C_RESET} $TURNSTILE_VERSION - a mechanical gate on the push path
+
+  ${C_BOLD}Usage${C_RESET}
+    turnstile install      install the global hook dispatcher
+    turnstile uninstall    remove it
+    turnstile status       show gate + this repo's checks
+    turnstile run          run this repo's checks now, without pushing
+    turnstile doctor       diagnose the installation
+
+  ${C_BOLD}Per-repo config${C_RESET} (${CONFIG_NAME} in the repo root)
+    lint: make lint
+    test: go test ./...
+
+  A repo with no ${CONFIG_NAME} file passes straight through.
+  Bypass one push deliberately with: git push --no-verify
+
+EOF
+}
+
+case "${1:-}" in
+  __pre-push)  shift; cmd_pre_push "$@" ;;
+  install)     cmd_install ;;
+  uninstall)   cmd_uninstall ;;
+  status)      cmd_status ;;
+  run)         cmd_run ;;
+  doctor)      cmd_doctor ;;
+  ""|-h|--help|help) usage ;;
+  --version)   printf '%s\n' "$TURNSTILE_VERSION" ;;
+  *)           die "unknown command: $1  (try: turnstile --help)" ;;
+esac
