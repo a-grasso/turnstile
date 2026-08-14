@@ -117,6 +117,14 @@ compute_range() {
     # Deleting a remote branch pushes no content - nothing to validate.
     [ "$local_sha" = "$ZERO" ] && continue
 
+    if [ "$have_range" -eq 0 ]; then
+      # Prototype limit: only the first content-bearing ref is gated. Say so
+      # loudly - a gate that silently checks one ref of three reads as having
+      # checked all three. Checked before overwriting TURNSTILE_RANGE.
+      warn "turnstile: multi-ref push - only $TURNSTILE_RANGE checked, $local_ref was NOT"
+      continue
+    fi
+
     if [ "$remote_sha" = "$ZERO" ] || [ -z "$remote_sha" ]; then
       # New remote branch: diff against the default branch when we can find
       # it, otherwise fall back to the last commit rather than the repo root.
@@ -128,7 +136,6 @@ compute_range() {
     TURNSTILE_LOCAL_SHA="$local_sha"
     TURNSTILE_REMOTE_SHA="$remote_sha"
     have_range=0
-    break   # prototype: gate the first content-bearing ref, not each one
   done
 
   [ "$have_range" -eq 0 ] || return 1
@@ -160,6 +167,13 @@ default_base() {
 
 # Runs every configured check, buffering output and surfacing it only on
 # failure. Returns the number of failures.
+#
+# TRUST: `.turnstile` is executed with `eval`. It is repo content, so cloning a
+# hostile repo and pushing from it runs its code as you. That is the same trust
+# level as a Makefile or a package.json script, and acceptable for repos you
+# own - but it is why no-mistakes reads its equivalent config only from the
+# trusted default branch. If turnstile ever gates a repo that takes outside
+# contributions, that is the fix, not a sandbox.
 run_checks() {
   local label="${1:-turnstile}"
   local -a names=() cmds=()

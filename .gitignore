@@ -1,1 +1,2 @@
-.turnstile.log
+__pycache__/
+*.pyc

@@ -44,6 +44,13 @@ have decided to take responsibility. It is the wrong one for an agent, which
 has decided nothing and is routing around a failing check because that makes
 the task look finished. So the second hook closes it, for the agent only.
 
+**How firmly it closes it: not very.** The blocker is regex over the command
+string, so `sh -c` wrapping, quote splitting, an alias, or a helper script that
+calls `git push --no-verify` itself all walk straight past it. It raises the
+cost of an accidental bypass from zero to deliberate; it is not a security
+boundary and cannot become one at this layer. The `pre-push` hook is the actual
+gate — this only stops the model from reflexively reaching for the hatch.
+
 ## Install
 
 Nothing is installed until you run this. `install` writes a **global**

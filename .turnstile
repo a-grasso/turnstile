@@ -1,0 +1,4 @@
+# turnstile gates itself.
+syntax-sh: bash -n bin/turnstile && bash -n hooks/dispatch
+syntax-py: python3 -m py_compile claude/no-bypass.py
+no-pyc:    ! git diff --cached --name-only --diff-filter=d | grep -q "\.pyc$"
