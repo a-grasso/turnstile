@@ -129,8 +129,24 @@ training you to ignore it.
 
 The `PreToolUse` hook is the way out, and the reason it is worth having beyond
 bypass-blocking: it fires inside a session that *does* know why the change was
-made. Capturing intent there and handing it to a review stage is the next step,
-and it is a real design problem, not a TODO.
+made. Capturing intent there and handing it to a review stage is the next step.
+
+**Except the noise did not show up when probed.** Two trials of `claude -p`
+given the diff and nothing else:
+
+| diff | findings | false positives |
+|---|---|---|
+| turnstile's own 852-line initial commit (new code) | 5 | 0 — two were real bugs (committed `.pyc`, dead `.gitignore` entry) |
+| `reflock@8f884e6` (modifies existing code; its whole point is a deliberate "do **not** auto-repair" decision that should bait a false positive) | 1 | 0 — real string drift between two copies meant to stay in sync |
+
+On the second, an arm run *with* the intent supplied produced the **same single
+finding**. Intent changed nothing, and the no-intent arm did not flag the
+deliberate decision as a bug.
+
+n=2, both on code with tests and clear structure, so this is suggestive rather
+than settled. The live hypothesis is narrower than "review needs intent":
+intent matters when it is *not recoverable from the diff*. Where tests and
+structure already encode the why, a hook-supplied diff may be enough.
 
 **Output is tail-only.** Failures print the last 40 lines, not the whole log. A
 5000-line test dump inside a hook is how people learn to reach for
