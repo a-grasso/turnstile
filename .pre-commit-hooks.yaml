@@ -1,0 +1,23 @@
+# Lets turnstile's AI modules be used from the `pre-commit` framework, in repos
+# that already standardise on it and do not want a second hook manager.
+#
+#   # .pre-commit-config.yaml
+#   repos:
+#     - repo: https://github.com/<you>/turnstile
+#       rev: v0.2.0
+#       hooks:
+#         - id: turnstile-ai
+#
+# The module list still comes from the repo's own `.turnstile` file - this only
+# decides when the runner fires, never what it runs.
+- id: turnstile-ai
+  name: turnstile ai modules
+  description: Run the AI modules declared in .turnstile against the staged diff.
+  entry: bin/turnstile-ai --staged
+  language: script
+  # The runner diffs the whole staged set itself, so pre-commit must not also
+  # pass it a file list - and it must still fire when only deletions are staged.
+  pass_filenames: false
+  always_run: true
+  # Findings go to stderr as a report to read, not as a patch to apply.
+  verbose: true

@@ -9,7 +9,7 @@
 
 set -uo pipefail
 
-TURNSTILE_VERSION="0.1.0-prototype"
+TURNSTILE_VERSION="0.2.0-prototype"
 
 # ---------------------------------------------------------------- paths
 
@@ -69,7 +69,7 @@ config_path() {
   [ -n "$root" ] && printf '%s/%s' "$root" "$CONFIG_NAME"
 }
 
-# Emits "name<TAB>command" per configured check.
+# Emits "name<TAB>command" per configured *deterministic* check.
 #
 # Format is deliberately line-oriented rather than YAML/TOML: no parser
 # dependency, and a config that cannot express anything but a list of commands
@@ -78,6 +78,11 @@ config_path() {
 #   # comment
 #   lint: make lint
 #   test: go test ./...
+#   ai review: block=high     <- not a command; owned by bin/turnstile-ai
+#
+# `ai <name>:` lines are filtered out here rather than parsed. Their value is
+# an option list, not a shell command, and this function's output is fed
+# straight to `eval` - so leaking one through would execute `block=high`.
 read_checks() {
   local cfg; cfg="$(config_path)" || return 1
   [ -f "$cfg" ] || return 1
@@ -91,9 +96,44 @@ read_checks() {
     name="${name%"${name##*[![:space:]]}"}"          # rtrim
     cmd="${cmd#"${cmd%%[![:space:]]*}"}"             # ltrim
     [ -z "$cmd" ] && continue
+    # The `ai` prefix is reserved for module declarations. A line that claims
+    # it but carries no `k=v` option is almost certainly a deterministic check
+    # written before the prefix existed - say so instead of dropping it, since
+    # silently losing a check is the one failure a gate must never have.
+    case "$name" in
+      ai\ *|ai)
+        case "$cmd" in
+          *=*) ;;
+          *) warn "turnstile: '$name' looks like a check, but 'ai' is reserved for modules - ignoring it" ;;
+        esac
+        continue
+        ;;
+    esac
     printf '%s\t%s\n' "$name" "$cmd"
   done < "$cfg"
 }
+
+# Emits "name<TAB>options" per configured AI module. Display and
+# has-any-configured purposes only - bin/turnstile-ai parses the config itself
+# so that it stays runnable with no bash gate installed.
+read_ai_checks() {
+  local cfg; cfg="$(config_path)" || return 1
+  [ -f "$cfg" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in ai\ *) ;; *) continue ;; esac
+    case "$line" in *:*) ;; *) continue ;; esac
+    local name="${line%%:*}" opts="${line#*:}"
+    name="${name#ai }"
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    opts="${opts#"${opts%%[![:space:]]*}"}"
+    [ -z "$name" ] && continue
+    printf '%s\t%s\n' "$name" "$opts"
+  done < "$cfg"
+}
+
+AI_RUNNER="$TURNSTILE_BIN/turnstile-ai"
 
 # ---------------------------------------------------------------- push range
 
@@ -183,7 +223,10 @@ run_checks() {
     names+=("$name"); cmds+=("$cmd")
   done < <(read_checks)
 
-  if [ "${#names[@]}" -eq 0 ]; then
+  local ai_count=0
+  ai_count="$(read_ai_checks | grep -c . || true)"
+
+  if [ "${#names[@]}" -eq 0 ] && [ "$ai_count" -eq 0 ]; then
     dim "turnstile: no $CONFIG_NAME checks in $(repo_root) - passing through"
     return 0
   fi
@@ -194,6 +237,20 @@ run_checks() {
 
   local failures=0 i out rc start elapsed
   local logdir; logdir="$(mktemp -d "${TMPDIR:-/tmp}/turnstile.XXXXXX")"
+
+  # The AI modules start first and run while the deterministic checks do. They
+  # are the slow half by two orders of magnitude, so paying for them serially
+  # after a passing test suite would make the gate feel like it hangs.
+  local ai_pid="" ai_log="$logdir/ai.log"
+  if [ "$ai_count" -gt 0 ]; then
+    if [ -x "$AI_RUNNER" ]; then
+      TURNSTILE_HOME="$TURNSTILE_HOME" "$AI_RUNNER" \
+        --range "${TURNSTILE_RANGE:-HEAD~1..HEAD}" >"$ai_log" 2>&1 </dev/null &
+      ai_pid=$!
+    else
+      warn "turnstile: $ai_count ai module(s) configured but $AI_RUNNER is missing"
+    fi
+  fi
 
   for i in "${!names[@]}"; do
     name="${names[$i]}"; cmd="${cmds[$i]}"
@@ -222,6 +279,26 @@ run_checks() {
     fi
   done
 
+  if [ -n "$ai_pid" ]; then
+    if kill -0 "$ai_pid" 2>/dev/null; then
+      [ -n "$CLEAR_LINE" ] && printf '  %s… ai%s' "$C_DIM" "$C_RESET" >&2
+    fi
+    wait "$ai_pid"; rc=$?
+    printf '%s' "$CLEAR_LINE" >&2
+    cat "$ai_log" >&2
+    # Exit 1 means findings at or above the configured block level. Anything
+    # else the runner already reported as a `?` and deliberately did not block
+    # on - see the fail-open note in bin/turnstile-ai.
+    [ "$rc" -eq 1 ] && failures=$((failures + 1))
+    # Degradation is read off the report rather than the exit code on purpose:
+    # the runner has to keep returning 0 here so that a pre-commit hook does
+    # not fail the commit over a network blip. But a summary that says
+    # everything passed when a module reviewed nothing is a lie the gate
+    # cannot afford, so the count is surfaced separately.
+    TURNSTILE_AI_DEGRADED="$(grep -c '^  ? ai ' "$ai_log" || true)"
+    export TURNSTILE_AI_DEGRADED
+  fi
+
   rm -rf "$logdir"
   return $failures
 }
@@ -241,6 +318,10 @@ cmd_pre_push() {
 
   run_checks "pre-push → ${1:-remote}"
   local failures=$?
+
+  if [ "${TURNSTILE_AI_DEGRADED:-0}" -gt 0 ] && [ "$failures" -eq 0 ]; then
+    warn "turnstile: ${TURNSTILE_AI_DEGRADED} ai module(s) could not run - this push was NOT reviewed by them"
+  fi
 
   if [ "$failures" -gt 0 ]; then
     say ""
@@ -276,7 +357,11 @@ cmd_run() {
     say ""
     return 1
   fi
-  say "  ${C_GREEN}${C_BOLD}all checks passed${C_RESET}"
+  if [ "${TURNSTILE_AI_DEGRADED:-0}" -gt 0 ]; then
+    say "  ${C_GREEN}${C_BOLD}all checks passed${C_RESET} ${C_YELLOW}(${TURNSTILE_AI_DEGRADED} ai module(s) could not run)${C_RESET}"
+  else
+    say "  ${C_GREEN}${C_BOLD}all checks passed${C_RESET}"
+  fi
   say ""
   return 0
 }
@@ -381,6 +466,17 @@ cmd_status() {
     while IFS=$'\t' read -r name cmd; do
       printf '                %s%-10s%s %s\n' "$C_BOLD" "$name" "$C_RESET" "$cmd" >&2
     done < <(read_checks)
+    if [ "$(read_ai_checks | grep -c . || true)" -gt 0 ]; then
+      say "  ai modules"
+      # Ask the runner rather than printing the config back: it is what does the
+      # repo → user → built-in resolution, so it is the only thing that knows
+      # which file a given module name actually lands on.
+      if [ -x "$AI_RUNNER" ]; then
+        "$AI_RUNNER" --list </dev/null 2>&1 | sed 's/^  /              /' >&2
+      else
+        warn "runner missing: $AI_RUNNER"
+      fi
+    fi
   else
     say "  checks      ${C_DIM}none (no $CONFIG_NAME file - pushes pass through)${C_RESET}"
   fi
@@ -420,6 +516,31 @@ cmd_doctor() {
     problems=$((problems + 1))
   fi
 
+  # The AI half is only a problem when a repo actually asked for it. A machine
+  # that only ever runs deterministic checks should not be told it is broken
+  # for lacking a `claude` binary it will never invoke.
+  local ai_count; ai_count="$(read_ai_checks 2>/dev/null | grep -c . || true)"
+  if [ "${ai_count:-0}" -gt 0 ]; then
+    if [ -x "$AI_RUNNER" ]; then
+      say "  ${C_GREEN}✓${C_RESET} ai runner executable"
+    else
+      say "  ${C_RED}✗${C_RESET} ai runner missing or not executable: $AI_RUNNER"
+      problems=$((problems + 1))
+    fi
+    if command -v claude >/dev/null 2>&1; then
+      say "  ${C_GREEN}✓${C_RESET} claude CLI on PATH"
+    else
+      say "  ${C_RED}✗${C_RESET} claude CLI not on PATH - ai modules will be skipped"
+      problems=$((problems + 1))
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+      say "  ${C_GREEN}✓${C_RESET} python3 on PATH"
+    else
+      say "  ${C_RED}✗${C_RESET} python3 not on PATH - ai runner cannot start"
+      problems=$((problems + 1))
+    fi
+  fi
+
   say ""
   [ "$problems" -eq 0 ] && say "  no problems found" || say "  $problems problem(s)"
   say ""
@@ -436,11 +557,14 @@ usage() {
     turnstile uninstall    remove it
     turnstile status       show gate + this repo's checks
     turnstile run          run this repo's checks now, without pushing
+    turnstile ai [args]    run just the ai modules (see: turnstile ai --help)
     turnstile doctor       diagnose the installation
 
   ${C_BOLD}Per-repo config${C_RESET} (${CONFIG_NAME} in the repo root)
     lint: make lint
     test: go test ./...
+    ai review:  block=high
+    ai secrets: block=medium
 
   A repo with no ${CONFIG_NAME} file passes straight through.
   Bypass one push deliberately with: git push --no-verify
@@ -454,6 +578,7 @@ case "${1:-}" in
   uninstall)   cmd_uninstall ;;
   status)      cmd_status ;;
   run)         cmd_run ;;
+  ai)          shift; exec "$AI_RUNNER" "$@" ;;
   doctor)      cmd_doctor ;;
   ""|-h|--help|help) usage ;;
   --version)   printf '%s\n' "$TURNSTILE_VERSION" ;;

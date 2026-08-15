@@ -13,7 +13,15 @@ A mechanical gate on the push path.
         range_test.go:41: want abc..def, got abc..HEAD
     FAIL
 
-  push refused - 1 check(s) failed
+  • ai review (2 findings, 18s)
+
+    high     Shell injection via unescaped filename in os.system
+    report.py:59  [review, blocks]
+      os.system("cp -r " + name + " " + dest) concatenates an
+      unsanitized filename derived from sys.argv[1] into a shell
+      command with no quoting.
+
+  push refused - 2 check(s) failed
     fix them, or bypass deliberately:  git push --no-verify
 ```
 
@@ -21,7 +29,9 @@ Not a skill. Not an agent. A `pre-push` hook that runs the repo's own checks
 and refuses the push if they fail — because the code path was taken, not
 because a model decided the moment was relevant.
 
-**Status: prototype.** One evening old, unproven in daily use.
+**Status: prototype.** Two evenings old, unproven in daily use. The
+deterministic half is solid; the [AI modules](#ai-modules) are new and have no
+eval behind them yet.
 
 ## Why
 
@@ -64,11 +74,19 @@ turnstile install
 turnstile doctor
 ```
 
+The AI modules additionally need `python3` and the `claude` CLI on PATH;
+`doctor` checks for both, but only in a repo that actually configures a module.
+Symlink `bin/turnstile-ai` too if you want to call the runner directly (for a
+pre-commit hook, say) rather than through `turnstile ai`.
+
 Then, per repo you want gated, a `.turnstile` file in the root:
 
 ```
 lint: make lint
 test: go test ./...
+
+ai review:  block=high
+ai secrets: block=medium
 ```
 
 Repos without one pass straight through. See [examples/.turnstile](examples/.turnstile).
@@ -86,8 +104,132 @@ turnstile install      install the global hook dispatcher
 turnstile uninstall    remove it
 turnstile status       show gate state + this repo's checks
 turnstile run          run this repo's checks now, without pushing
+turnstile ai [args]    run only the ai modules
 turnstile doctor       diagnose the installation
 ```
+
+## AI modules
+
+A line of the form `ai <name>: block=<level>` adds a model-backed check.
+Modules run **in parallel with each other and with the deterministic checks**,
+so the slow half costs wall-clock once rather than once per module.
+
+```
+ai review:  block=high         # refuse the push on high or critical findings
+ai secrets: block=medium       # ...and on medium for this one
+ai review:  block=never        # report findings, never refuse
+```
+
+`block` names the lowest severity that refuses a push. Findings below it still
+print, marked `advisory`. Severities are `low`, `medium`, `high`, `critical`.
+
+Two built-ins ship: **`review`** (correctness defects provable from the diff)
+and **`secrets`** (credentials and private data about to be published).
+
+### Writing one
+
+A module is markdown with frontmatter. The body *is* the system prompt; the
+runner supplies the diff and the finding schema.
+
+```markdown
+---
+name: migrations
+description: Schema changes that cannot be rolled back.
+block: critical
+model: sonnet
+---
+
+You are reviewing a diff for irreversible database migrations.
+Report a finding when a migration drops a column or table with no
+down-path...
+```
+
+`block` and `model` in frontmatter are the module's *defaults*. The
+`.turnstile` line overrides both (`ai review: block=critical model=opus`), so a
+module can declare what it needs without dictating it to every repo.
+
+Module files resolve **repo → user → built-in**, first hit wins:
+
+```
+<repo>/.turnstile.d/modules/<name>.md    # this project's house rules
+~/.turnstile/modules/<name>.md           # your own, everywhere
+<turnstile>/modules/<name>.md            # shipped
+```
+
+So a repo can override `review` for its own conventions without forking, and
+`turnstile status` prints which file each name actually resolved to.
+
+### Findings are structured, not prose
+
+Modules do not return text that gets grepped. The runner passes a JSON schema
+to the model and reads back validated objects with `file`, `line`, `severity`,
+`title`, and `detail`. A module that returns nothing schema-conforming is an
+error, not a silently-empty pass — parsing prose for verdicts is the failure
+mode this exists to avoid.
+
+### Cost, and the cache
+
+Each module call is a real API call (~$0.15 on `sonnet` for a small diff), and
+a gate you pay for on every retry is a gate you turn off. Results are cached
+under `~/.turnstile/cache/ai/` keyed on a hash of **the diff, the module's own
+source, and the model**. So:
+
+- Re-pushing the same commits is free and instant (~0.1s vs ~30s).
+- Editing a module's prompt invalidates its cache, because tuning a prompt and
+  silently replaying the old answer reads as the edit having done nothing.
+
+### Failure is open, on purpose
+
+A module that cannot run - network down, no `claude` on PATH, a timeout -
+prints `?` and **does not refuse the push**. A gate that fails closed on a
+network blip is a gate people learn to `--no-verify` past, which costs more
+than the review it was protecting. Pass `--strict` to invert that where you
+would rather stop.
+
+Diffs are capped at 4000 lines before they reach the model, and the truncation
+is stated in the report rather than silently narrowing what was reviewed. A
+module that overruns `TURNSTILE_AI_TIMEOUT` (default 300s) is killed as a
+process group, because a hook that hangs is worse than one that fails.
+
+When a module is skipped this way, the summary says so — `all checks passed
+(1 ai module(s) could not run)` — rather than reporting a clean pass for a
+review that never happened.
+
+```
+TURNSTILE_MODEL         default model for all modules (default: sonnet)
+TURNSTILE_AI_TIMEOUT    per-module timeout in seconds (default: 300)
+TURNSTILE_CACHE         cache directory (default: ~/.turnstile/cache/ai)
+```
+
+## Use it as a pre-commit hook
+
+The runner is a standalone entry point with no dependency on the bash gate or
+on `core.hooksPath`, so it works in repos that already have a hook manager:
+
+```sh
+turnstile-ai --staged            # review the staged diff
+turnstile-ai --range main..HEAD  # review a range
+turnstile-ai --only secrets --json
+```
+
+For the [pre-commit](https://pre-commit.com) framework, this repo ships a
+[`.pre-commit-hooks.yaml`](.pre-commit-hooks.yaml):
+
+```yaml
+repos:
+  - repo: https://github.com/<you>/turnstile
+    rev: v0.2.0
+    hooks:
+      - id: turnstile-ai
+```
+
+The module list still comes from the repo's `.turnstile` either way — the hook
+manager decides *when* the runner fires, never *what* it runs.
+
+Pre-commit is the more aggressive placement: it fires on every commit rather
+than once per push, which multiplies both the latency and the bill. `secrets`
+is the module that earns it, since a secret is unrecoverable the moment it is
+pushed, and `review` is usually better left on pre-push.
 
 ## The global-hooksPath problem
 
@@ -114,39 +256,66 @@ Two cases it deliberately does not fight:
 
 ## Design notes
 
-**Deterministic only, on purpose.** No model in the push path. Checks are
-whatever the repo already has — `make lint`, `go test`. Fast, free, never
-wrong, never annoying. That covers the boring majority of what a gate should
-catch: broken build, failing test, lint drift.
+**Deterministic checks stay the floor.** `make lint`, `go test` — fast, free,
+never wrong, never annoying. They cover the boring majority of what a gate
+should catch: broken build, failing test, lint drift. The AI modules are added
+on top of that floor, never in place of it. A model is the wrong tool for
+anything a compiler can already decide.
 
-**The interesting half is deliberately absent.** Adversarial review of the diff
-in a fresh context is where the real value is (see
-`ai-dev/explorations/no-mistakes.md`), and it is not here yet, for one specific
-reason: *a git hook knows the diff but not the intent*. A reviewer without
+**The model in the push path had one real objection**, and it was not cost or
+latency: *a git hook knows the diff but not the intent*. A reviewer without
 intent flags every deliberate decision as a mistake, and after two of those you
-stop reading the findings — at which point the gate is costing you time and
-training you to ignore it.
+stop reading the findings — at which point the gate costs you time and trains
+you to ignore it.
 
-The `PreToolUse` hook is the way out, and the reason it is worth having beyond
-bypass-blocking: it fires inside a session that *does* know why the change was
-made. Capturing intent there and handing it to a review stage is the next step.
-
-**Except the noise did not show up when probed.** Two trials of `claude -p`
-given the diff and nothing else:
+That objection was probed three times before the stage was built, each an arm
+of `claude -p` given the diff and nothing else:
 
 | diff | findings | false positives |
 |---|---|---|
 | turnstile's own 852-line initial commit (new code) | 5 | 0 — two were real bugs (committed `.pyc`, dead `.gitignore` entry) |
 | `reflock@8f884e6` (modifies existing code; its whole point is a deliberate "do **not** auto-repair" decision that should bait a false positive) | 1 | 0 — real string drift between two copies meant to stay in sync |
+| a 61-line script with **no tests and no structure**: module-level globals, no argv validation, bare `except`, env-var token | 5 | 0 — shell injection via `os.system`, a `cp` reading the wrong path, an unclosed file, a division by zero on empty input, one internal hostname |
 
-On the second, an arm run *with* the intent supplied produced the **same single
-finding**. Intent changed nothing, and the no-intent arm did not flag the
-deliberate decision as a bug.
+The third was chosen because the first two shared a weakness: both were code
+where tests and structure already encoded the *why*, which is the easy case.
+The hypothesis worth falsifying was that intent matters most exactly where
+nothing else records it. It did not degrade. The reviewer reported the four
+real defects, and flagged none of the missing tests, the globals, or the
+unvalidated `argv` — the noise the objection predicted.
 
-n=2, both on code with tests and clear structure, so this is suggestive rather
-than settled. The live hypothesis is narrower than "review needs intent":
-intent matters when it is *not recoverable from the diff*. Where tests and
-structure already encode the why, a hook-supplied diff may be enough.
+So the live hypothesis is narrower than "review needs intent": intent matters
+when a decision is *unrecoverable from the diff and looks like a defect*.
+Absent structure alone does not produce that. Still small-n, and all three arms
+used the same model, so treat it as the reason this stage was unblocked rather
+than as a settled result.
+
+**Prompts do most of the work.** The built-in modules spend more words on what
+*not* to report than on what to find, and the runner prepends a contract to
+every module saying that a deliberate decision it cannot distinguish from a
+mistake is not a finding. That is the tuning surface: a false positive here is
+not a wasted minute, it is the author learning to ignore the gate.
+
+**Blocking is a per-module decision, not a global one.** `secrets` blocks at
+`medium` and `review` at `high` in the same file, because the two failure modes
+are not comparable — a pushed secret is unrecoverable, a missed correctness
+finding is a bug report. Anything below the line still prints, so lowering the
+bar costs nothing but reading.
+
+**Frontmatter is not YAML** — flat `key: value`, same reasoning as the
+line-oriented `.turnstile` format. No dependency, and a format that can only
+express flat strings cannot grow into a second configuration language.
+
+**The runner does not use the bash gate's config parser.** It re-implements it
+in Python. That duplication is deliberate: `--staged` has to work in a repo
+with no `core.hooksPath` and no turnstile install at all, and a format this
+small is cheaper to parse twice than to factor into a third component both
+sides shell out to.
+
+**Modules get no tools.** `--tools ""`. The reviewer's job is to read a diff it
+has already been given, and a hook is the wrong place to hand a model the
+ability to edit the tree it is gating. A module can opt back in via
+`tools:` in its frontmatter, which is a decision to make deliberately.
 
 **Output is tail-only.** Failures print the last 40 lines, not the whole log. A
 5000-line test dump inside a hook is how people learn to reach for
@@ -165,6 +334,18 @@ isolation belongs with the review stage, where it actually buys something.
 **Unsolved: the first-ref-only shortcut.** `compute_range` gates the first
 content-bearing ref of a push and ignores the rest. Fine for `git push`, wrong
 for `--all`.
+
+**Unsolved: the intent channel.** The `PreToolUse` hook fires inside a session
+that *does* know why a change was made, and could hand that to the review
+stage. The probe above is the reason that is not urgent any more, not a reason
+it is worthless — the case it would help is precisely the one the probe could
+not construct, a deliberate decision that reads as a defect.
+
+**Unsolved: no eval.** Module prompts are tuned by reading their output on a
+handful of diffs. There is no corpus of diffs with known defects, so a prompt
+change that trades a true positive for a false negative is currently invisible.
+That is the next thing worth building, and it is what would turn the n=3 table
+above into something you could actually rely on.
 
 ## Prior art
 

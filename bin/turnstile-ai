@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+"""turnstile-ai - the AI half of the gate.
+
+Runs `ai <name>: block=<level>` modules declared in a repo's `.turnstile`
+against the diff being pushed (or staged) and returns structured findings.
+
+Standalone on purpose. The bash gate shells out to this in parallel with the
+deterministic checks, but nothing here depends on being called from there:
+
+    turnstile-ai --range origin/main..HEAD    # what pre-push does
+    turnstile-ai --staged                     # what a pre-commit hook does
+
+Exit codes:  0 pass (or advisory-only findings)   1 blocked   2 error (--strict)
+
+See README.md for the design.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+VERSION = "0.2.0-prototype"
+
+# Bumped when the prompt contract or finding shape changes, so a cache written
+# by an older runner is never replayed against newer semantics.
+SCHEMA_VERSION = 1
+
+SEVERITIES = ("low", "medium", "high", "critical")
+SEVERITY_RANK = {s: i + 1 for i, s in enumerate(SEVERITIES)}
+BLOCK_LEVELS = {"never": None, **{s: SEVERITY_RANK[s] for s in SEVERITIES}}
+
+CONFIG_NAME = ".turnstile"
+
+# A diff larger than this is truncated before it reaches the model. Past a few
+# thousand lines the review degrades into skimming anyway, and an unbounded
+# hook is one pathological merge away from a context-limit error.
+MAX_DIFF_LINES = 4000
+MAX_DIFF_BYTES = 400_000
+
+CACHE_TTL_SECONDS = 30 * 24 * 3600
+
+FINDING_SCHEMA = {
+    "type": "object",
+    "required": ["findings"],
+    "additionalProperties": False,
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["file", "line", "severity", "title", "detail"],
+                "additionalProperties": False,
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Repo-relative path from the diff, or '-' if not file-specific.",
+                    },
+                    "line": {
+                        "type": "integer",
+                        "description": "Line number in the post-change file, or 0 if not line-specific.",
+                    },
+                    "severity": {"type": "string", "enum": list(SEVERITIES)},
+                    "title": {"type": "string", "description": "One line, under 80 chars."},
+                    "detail": {
+                        "type": "string",
+                        "description": "What breaks and under what conditions. Concrete, not advisory.",
+                    },
+                },
+            },
+        }
+    },
+}
+
+PROMPT_CONTRACT = """
+Report only what you can defend from the diff itself.
+
+This runs as a git hook. It sees the change but not the conversation that
+produced it, so you do not know the author's intent. Treat that as a constraint
+on what you may claim, not a licence to guess: a deliberate decision you cannot
+distinguish from a mistake is not a finding. The cost of a false positive here
+is not a wasted minute - it is the author learning to ignore this gate, at
+which point it protects nothing.
+
+If you find nothing that meets that bar, return an empty findings list. That is
+a normal and frequent outcome, not a failure to do the job.
+""".strip()
+
+
+# ------------------------------------------------------------------ output
+
+
+def _tty() -> bool:
+    return sys.stderr.isatty() and not os.environ.get("NO_COLOR")
+
+
+if _tty():
+    C_RESET, C_DIM, C_BOLD = "\033[0m", "\033[2m", "\033[1m"
+    C_RED, C_GREEN, C_YELLOW, C_BLUE = "\033[31m", "\033[32m", "\033[33m", "\033[34m"
+else:
+    C_RESET = C_DIM = C_BOLD = C_RED = C_GREEN = C_YELLOW = C_BLUE = ""
+
+SEVERITY_COLOR = {
+    "critical": C_RED,
+    "high": C_RED,
+    "medium": C_YELLOW,
+    "low": C_DIM,
+}
+
+
+def say(msg: str = "") -> None:
+    print(msg, file=sys.stderr)
+
+
+def warn(msg: str) -> None:
+    say(f"{C_YELLOW}! {msg}{C_RESET}")
+
+
+class TurnstileError(Exception):
+    """A failure to *run* a module, as distinct from a finding it reported."""
+
+
+# ------------------------------------------------------------------ git
+
+
+def git(*args: str, cwd: str | None = None) -> str:
+    proc = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, stdin=subprocess.DEVNULL
+    )
+    if proc.returncode != 0:
+        raise TurnstileError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def repo_root() -> str:
+    try:
+        return git("rev-parse", "--show-toplevel").strip()
+    except TurnstileError:
+        raise TurnstileError("not inside a git repository")
+
+
+def default_range(root: str) -> str:
+    """What a push would validate, for `turnstile ai` invoked by hand.
+
+    Mirrors the bash gate's `cmd_run`: upstream if the branch has one, else the
+    first default branch that is a strict ancestor, else git's empty tree so a
+    fresh repo reviews everything rather than nothing.
+    """
+    try:
+        upstream = git(
+            "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", cwd=root
+        ).strip()
+        if upstream:
+            return f"{upstream}..HEAD"
+    except TurnstileError:
+        pass
+
+    try:
+        head = git("rev-parse", "--verify", "HEAD", cwd=root).strip()
+    except TurnstileError:
+        head = ""
+
+    for base in ("origin/HEAD", "origin/main", "origin/master", "main", "master"):
+        proc = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", base],
+            cwd=root, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        )
+        if proc.returncode != 0 or proc.stdout.strip() == head:
+            continue
+        anc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base, "HEAD"],
+            cwd=root, capture_output=True, stdin=subprocess.DEVNULL,
+        )
+        if anc.returncode == 0:
+            return f"{base}..HEAD"
+
+    return "4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD"
+
+
+def diff_for(range_spec: str | None, staged: bool, root: str) -> tuple[str, list[str]]:
+    """Returns (diff text, changed files)."""
+    if staged:
+        args = ["diff", "--cached"]
+    else:
+        args = ["diff", range_spec or default_range(root)]
+
+    # -U8: a hook reviewer has no ability to open the file, so the hunk context
+    # is the only surrounding code it will ever see. The default 3 lines is too
+    # thin to tell a deliberate early-return from a missing guard.
+    diff = git(*args, "-U8", "--no-color", cwd=root)
+    files = [f for f in git(*args, "--name-only", cwd=root).splitlines() if f]
+    return diff, files
+
+
+def truncate_diff(diff: str) -> tuple[str, str | None]:
+    """Caps the diff, returning (diff, note-about-truncation)."""
+    note = None
+    lines = diff.splitlines()
+    if len(lines) > MAX_DIFF_LINES:
+        diff = "\n".join(lines[:MAX_DIFF_LINES])
+        note = f"diff truncated to {MAX_DIFF_LINES} of {len(lines)} lines"
+    if len(diff.encode()) > MAX_DIFF_BYTES:
+        diff = diff.encode()[:MAX_DIFF_BYTES].decode("utf-8", "ignore")
+        note = f"diff truncated to {MAX_DIFF_BYTES} bytes"
+    return diff, note
+
+
+# ------------------------------------------------------------------ config
+
+# `ai review: block=high model=sonnet`
+AI_LINE = re.compile(r"^ai\s+(?P<name>[A-Za-z0-9_.-]+)\s*:\s*(?P<opts>.*)$")
+
+
+def read_ai_checks(root: str) -> tuple[list[dict], list[str]]:
+    """Parses the `ai <name>: k=v ...` lines out of `.turnstile`.
+
+    Returns (checks, errors). A malformed line is reported and skipped rather
+    than raised: one typo on one line must not take every other module down
+    with it, because the failure mode of that is a gate that silently reviews
+    nothing while still looking configured.
+
+    This re-implements the bash gate's config parse rather than calling it. The
+    duplication is deliberate: `--staged` for a pre-commit hook has to work with
+    no bash gate installed at all, and a config format this small is cheaper to
+    parse twice than to factor into a third component both sides shell out to.
+    """
+    path = os.path.join(root, CONFIG_NAME)
+    if not os.path.isfile(path):
+        return [], []
+
+    checks, errors = [], []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = AI_LINE.match(line)
+            if not m:
+                continue
+
+            opts, bad = {}, None
+            for token in m.group("opts").split():
+                # A trailing comment ends the options. Documented examples put
+                # one here (`ai review: block=never   # advisory only`), so
+                # treating '#' as a malformed option would break the config
+                # the README tells people to write.
+                if token.startswith("#"):
+                    break
+                if "=" not in token:
+                    bad = f"{CONFIG_NAME}:{lineno}: expected key=value, got '{token}'"
+                    break
+                k, v = token.split("=", 1)
+                opts[k.strip()] = v.strip()
+
+            if bad:
+                errors.append(bad)
+                continue
+
+            block = opts.get("block")
+            if block is not None and block not in BLOCK_LEVELS:
+                errors.append(
+                    f"{CONFIG_NAME}:{lineno}: block='{block}' is not one of "
+                    f"{', '.join(BLOCK_LEVELS)}"
+                )
+                continue
+
+            checks.append({"name": m.group("name"), "opts": opts, "lineno": lineno})
+    return checks, errors
+
+
+# ------------------------------------------------------------------ modules
+
+
+def module_search_path(root: str) -> list[tuple[str, str]]:
+    """(origin label, directory), most specific first.
+
+    repo → user → built-in. A repo can override a built-in for its own house
+    rules; a user can override it for all their repos; the built-in is the
+    fallback so a fresh clone with `ai review:` in its config just works.
+    """
+    home = os.environ.get("TURNSTILE_HOME") or os.path.dirname(
+        os.path.dirname(os.path.realpath(__file__))
+    )
+    return [
+        ("repo", os.path.join(root, ".turnstile.d", "modules")),
+        ("user", os.path.expanduser("~/.turnstile/modules")),
+        ("built-in", os.path.join(home, "modules")),
+    ]
+
+
+def parse_frontmatter(text: str, where: str) -> tuple[dict, str]:
+    """Minimal `key: value` frontmatter. Body is everything after the fence.
+
+    Not YAML. Same reasoning as the line-oriented `.turnstile` format: no
+    dependency, and a format that can only express flat strings cannot grow
+    into a configuration language of its own.
+    """
+    if not text.startswith("---"):
+        raise TurnstileError(f"{where}: missing '---' frontmatter fence")
+
+    parts = text.split("\n---", 1)
+    if len(parts) != 2:
+        raise TurnstileError(f"{where}: unterminated frontmatter")
+
+    head = parts[0][3:]
+    body = parts[1].lstrip("-").lstrip("\n")
+
+    meta = {}
+    for lineno, line in enumerate(head.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            raise TurnstileError(f"{where}: frontmatter line {lineno}: expected 'key: value'")
+        k, v = line.split(":", 1)
+        meta[k.strip()] = v.strip().strip("'\"")
+
+    if not body.strip():
+        raise TurnstileError(f"{where}: module body is empty - nothing to prompt with")
+    return meta, body
+
+
+def load_module(name: str, root: str) -> dict:
+    for origin, directory in module_search_path(root):
+        path = os.path.join(directory, f"{name}.md")
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            meta, body = parse_frontmatter(text, path)
+            # Validated here as well as on the `.turnstile` side. An unknown
+            # level resolves to None, which is indistinguishable from `never`,
+            # so a typo would leave the module reporting findings and silently
+            # never blocking - configured-looking and toothless.
+            declared = meta.get("block")
+            if declared is not None and declared not in BLOCK_LEVELS:
+                raise TurnstileError(
+                    f"{path}: block: '{declared}' is not one of {', '.join(BLOCK_LEVELS)}"
+                )
+            return {
+                "name": name,
+                "origin": origin,
+                "path": path,
+                "meta": meta,
+                "body": body,
+                "source": text,
+            }
+    searched = "\n    ".join(d for _, d in module_search_path(root))
+    raise TurnstileError(f"no module '{name}'. Searched:\n    {searched}")
+
+
+# ------------------------------------------------------------------ cache
+
+
+def cache_dir() -> str:
+    base = os.environ.get("TURNSTILE_CACHE") or os.path.expanduser("~/.turnstile/cache/ai")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def cache_key(module: dict, diff: str, model: str) -> str:
+    """Keyed on the module source, not just its name.
+
+    Editing a module's prompt has to invalidate its cached findings, or tuning
+    a module against a diff silently replays the old answer and reads as the
+    edit having had no effect.
+    """
+    h = hashlib.sha256()
+    for part in (str(SCHEMA_VERSION), module["source"], model, PROMPT_CONTRACT, diff):
+        h.update(part.encode())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def cache_get(key: str) -> list | None:
+    path = os.path.join(cache_dir(), f"{key}.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if time.time() - payload.get("at", 0) > CACHE_TTL_SECONDS:
+        return None
+    return payload.get("findings")
+
+
+def cache_put(key: str, findings: list) -> None:
+    path = os.path.join(cache_dir(), f"{key}.json")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"at": time.time(), "findings": findings}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        # A cache that cannot be written is a slow gate, not a broken one.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def cache_prune() -> int:
+    removed, now = 0, time.time()
+    for entry in os.scandir(cache_dir()):
+        if entry.name.endswith(".json") and now - entry.stat().st_mtime > CACHE_TTL_SECONDS:
+            try:
+                os.unlink(entry.path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+# ------------------------------------------------------------------ model
+
+
+class _Completed:
+    """Minimal stand-in for CompletedProcess, so the parsing below is unchanged."""
+
+    __slots__ = ("returncode", "stdout", "stderr")
+
+    def __init__(self, returncode: int, stdout: str, stderr: str):
+        self.returncode = returncode
+        self.stdout = stdout or ""
+        self.stderr = stderr or ""
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """SIGTERM the whole group, then SIGKILL what is left."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def run_module(module: dict, diff: str, diff_note: str | None, root: str,
+               model: str, use_cache: bool, timeout: int) -> dict:
+    """Runs one module. Returns {name, findings, cached, seconds, error}."""
+    started = time.time()
+    result = {"name": module["name"], "findings": [], "cached": False,
+              "seconds": 0.0, "error": None}
+
+    key = cache_key(module, diff, model)
+    if use_cache:
+        hit = cache_get(key)
+        if hit is not None:
+            result["findings"] = hit
+            result["cached"] = True
+            return result
+
+    if not shutil.which("claude"):
+        raise TurnstileError("`claude` CLI not found on PATH")
+
+    prompt_parts = [PROMPT_CONTRACT, "", "The diff under review:", "", diff]
+    if diff_note:
+        prompt_parts.insert(2, f"NOTE: {diff_note}. Do not report on what you cannot see.")
+
+    tools = module["meta"].get("tools", "").strip()
+    cmd = [
+        "claude", "-p", "\n".join(prompt_parts),
+        "--model", model,
+        # No tools by default. The reviewer's job is to read a diff it has
+        # already been given; a hook is the wrong place to hand a model the
+        # ability to edit the tree it is gating.
+        "--tools", tools,
+        "--system-prompt", module["body"],
+        "--output-format", "json",
+        "--json-schema", json.dumps(FINDING_SCHEMA),
+    ]
+
+    # Own process group, killed as a group on timeout. `subprocess.run(timeout=)`
+    # signals only the direct child, then keeps blocking on stdout - which any
+    # surviving grandchild still holds open. In a git hook that is not a slow
+    # check, it is a push that never returns and cannot be explained.
+    proc = subprocess.Popen(
+        cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL, text=True, start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        raise TurnstileError(f"timed out after {timeout}s")
+
+    proc = _Completed(proc.returncode, stdout, stderr)
+
+    # Parse before checking the exit code: claude reports its own failures as a
+    # structured payload whose `result` is the human-readable reason. Falling
+    # back to the raw output would put an entire JSON blob on the report line
+    # where a one-line explanation belongs.
+    payload = None
+    try:
+        payload = json.loads(proc.stdout)
+    except ValueError:
+        pass
+
+    if payload is None:
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip().splitlines()
+            raise TurnstileError(
+                f"claude exited {proc.returncode}: {detail[-1][:200] if detail else 'no output'}"
+            )
+        raise TurnstileError("claude returned output that was not JSON")
+
+    if proc.returncode != 0 or payload.get("is_error"):
+        reason = str(payload.get("result") or "").strip().splitlines()
+        raise TurnstileError(reason[0][:200] if reason else f"claude exited {proc.returncode}")
+
+    structured = payload.get("structured_output")
+    if structured is None:
+        # The schema was supplied, so absence means the model never produced a
+        # conforming object. Guessing at the prose in `result` would be exactly
+        # the unreliable parse the schema exists to avoid.
+        raise TurnstileError("claude returned no schema-conforming output")
+
+    findings = []
+    for f in structured.get("findings", []):
+        if f.get("severity") not in SEVERITY_RANK:
+            continue
+        findings.append({
+            "module": module["name"],
+            "file": str(f.get("file") or "-"),
+            "line": int(f.get("line") or 0),
+            "severity": f["severity"],
+            "title": str(f.get("title") or "").strip(),
+            "detail": str(f.get("detail") or "").strip(),
+        })
+
+    result["findings"] = findings
+    result["seconds"] = time.time() - started
+    cache_put(key, findings)
+    return result
+
+
+# ------------------------------------------------------------------ report
+
+
+def block_threshold(check: dict, module: dict) -> int | None:
+    """Config wins over the module's declared default; absent both, advisory."""
+    level = check["opts"].get("block") or module["meta"].get("block") or "never"
+    return BLOCK_LEVELS.get(level)
+
+
+def resolve_model(check: dict, module: dict, cli_model: str | None) -> str:
+    """Most specific wins: `.turnstile` line, then an explicit --model, then the
+    module's own declared default, then the environment, then sonnet.
+
+    The module sits *below* an explicit `--model` because a module declaring
+    `model: opus` is stating what it needs by default, not overruling someone
+    who asked for a specific model on this run - but it sits above the env
+    default, or the frontmatter field would be decorative.
+    """
+    return (
+        check["opts"].get("model")
+        or cli_model
+        or module["meta"].get("model")
+        or os.environ.get("TURNSTILE_MODEL")
+        or "sonnet"
+    )
+
+
+def render(results: list[dict], threshold_by_module: dict, root: str) -> int:
+    """Prints the human report. Returns the count of blocking findings."""
+    all_findings = []
+    for r in results:
+        all_findings.extend(r["findings"])
+
+    blocking = [
+        f for f in all_findings
+        if (t := threshold_by_module.get(f["module"])) is not None
+        and SEVERITY_RANK[f["severity"]] >= t
+    ]
+
+    for r in results:
+        name = r["name"]
+        if r["error"]:
+            say(f"  {C_YELLOW}?{C_RESET} ai {name} {C_DIM}({r['error']}){C_RESET}")
+            continue
+        n = len(r["findings"])
+        if r["cached"]:
+            note = "cached"
+        else:
+            note = f"{r['seconds']:.0f}s"
+        mark = f"{C_GREEN}✓{C_RESET}" if n == 0 else f"{C_BLUE}•{C_RESET}"
+        word = "no findings" if n == 0 else f"{n} finding{'s' if n != 1 else ''}"
+        say(f"  {mark} ai {name} {C_DIM}({word}, {note}){C_RESET}")
+
+    if all_findings:
+        say("")
+        order = sorted(all_findings, key=lambda f: -SEVERITY_RANK[f["severity"]])
+        for f in order:
+            colour = SEVERITY_COLOR[f["severity"]]
+            blocks = f in blocking
+            marker = f"{C_BOLD}blocks{C_RESET}" if blocks else f"{C_DIM}advisory{C_RESET}"
+            loc = f["file"]
+            if f["line"]:
+                loc = f"{loc}:{f['line']}"
+            say(f"    {colour}{f['severity']:<8}{C_RESET} {f['title']}")
+            say(f"    {C_DIM}{loc}{C_RESET}  [{f['module']}, {marker}]")
+            for line in wrap(f["detail"], 72):
+                say(f"      {C_DIM}{line}{C_RESET}")
+            say("")
+
+    return len(blocking)
+
+
+def wrap(text: str, width: int) -> list[str]:
+    out, line = [], ""
+    for word in text.split():
+        if len(line) + len(word) + 1 > width:
+            out.append(line)
+            line = word
+        else:
+            line = f"{line} {word}".strip()
+    if line:
+        out.append(line)
+    return out
+
+
+# ------------------------------------------------------------------ main
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        prog="turnstile-ai",
+        description="Run the AI modules declared in a repo's .turnstile against a diff.",
+    )
+    src = p.add_mutually_exclusive_group()
+    src.add_argument("--range", dest="range_spec", metavar="A..B",
+                     help="git range to review (what pre-push passes)")
+    src.add_argument("--staged", action="store_true",
+                     help="review the staged diff (for a pre-commit hook)")
+    p.add_argument("--only", action="append", metavar="NAME",
+                   help="run just this module (repeatable)")
+    # No default: resolve_model has to be able to tell "asked for a model" from
+    # "did not", so that a module's declared default is not shadowed by one.
+    p.add_argument("--model", default=None,
+                   help="override the model for every module this run")
+    p.add_argument("--timeout", type=int,
+                   default=int(os.environ.get("TURNSTILE_AI_TIMEOUT", "300")))
+    p.add_argument("--no-cache", action="store_true")
+    p.add_argument("--json", action="store_true", help="emit findings as JSON on stdout")
+    p.add_argument("--strict", action="store_true",
+                   help="treat a module that fails to run as a blocking failure")
+    p.add_argument("--list", action="store_true", help="list resolved modules and exit")
+    p.add_argument("--prune-cache", action="store_true")
+    p.add_argument("--version", action="version", version=VERSION)
+    args = p.parse_args(argv)
+
+    try:
+        root = repo_root()
+    except TurnstileError as e:
+        warn(str(e))
+        return 2 if args.strict else 0
+
+    if args.prune_cache:
+        say(f"  pruned {cache_prune()} cache entries")
+        return 0
+
+    try:
+        checks, config_errors = read_ai_checks(root)
+    except TurnstileError as e:
+        warn(f"turnstile-ai: {e}")
+        return 2 if args.strict else 0
+
+    for err in config_errors:
+        warn(f"turnstile-ai: {err}")
+    if config_errors and args.strict:
+        return 2
+
+    if args.only:
+        checks = [c for c in checks if c["name"] in args.only]
+
+    if not checks:
+        return 0
+
+    # Resolution failures are config errors, not model errors: report every
+    # one, rather than dying on the first.
+    modules, resolve_errors = {}, []
+    for c in checks:
+        try:
+            modules[c["name"]] = load_module(c["name"], root)
+        except TurnstileError as e:
+            resolve_errors.append((c["name"], str(e)))
+
+    if args.list:
+        for c in checks:
+            m = modules.get(c["name"])
+            if not m:
+                say(f"  ai {c['name']:<12} {C_RED}unresolved{C_RESET}")
+                continue
+            level = c["opts"].get("block") or m["meta"].get("block") or "never"
+            say(f"  ai {c['name']:<12} block={level:<9} {C_DIM}{m['origin']}: {m['path']}{C_RESET}")
+        return 0
+
+    for name, err in resolve_errors:
+        warn(f"turnstile-ai: {err}")
+    if resolve_errors and args.strict:
+        return 2
+
+    try:
+        diff, changed = diff_for(args.range_spec, args.staged, root)
+    except TurnstileError as e:
+        warn(f"turnstile-ai: {e}")
+        return 2 if args.strict else 0
+
+    if not diff.strip():
+        return 0
+
+    diff, diff_note = truncate_diff(diff)
+    if diff_note:
+        warn(f"turnstile-ai: {diff_note}")
+
+    active = [c for c in checks if c["name"] in modules]
+    results, errored = [], False
+
+    # Modules run concurrently with each other; the bash gate runs this whole
+    # process concurrently with the deterministic checks. The slow half of the
+    # gate should cost wall-clock once, not once per module.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(active))) as pool:
+        futures = {
+            pool.submit(
+                run_module, modules[c["name"]], diff, diff_note, root,
+                resolve_model(c, modules[c["name"]], args.model),
+                not args.no_cache, args.timeout,
+            ): c
+            for c in active
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            c = futures[fut]
+            try:
+                results.append(fut.result())
+            except TurnstileError as e:
+                errored = True
+                results.append({"name": c["name"], "findings": [], "cached": False,
+                                "seconds": 0.0, "error": str(e)})
+
+    results.sort(key=lambda r: r["name"])
+    thresholds = {c["name"]: block_threshold(c, modules[c["name"]]) for c in active}
+
+    if args.json:
+        json.dump(
+            {
+                "range": args.range_spec or "staged",
+                "changed_files": changed,
+                "results": results,
+                "blocking": [
+                    f for r in results for f in r["findings"]
+                    if (t := thresholds.get(f["module"])) is not None
+                    and SEVERITY_RANK[f["severity"]] >= t
+                ],
+            },
+            sys.stdout, indent=2,
+        )
+        sys.stdout.write("\n")
+        blocking = sum(
+            1 for r in results for f in r["findings"]
+            if (t := thresholds.get(f["module"])) is not None
+            and SEVERITY_RANK[f["severity"]] >= t
+        )
+    else:
+        blocking = render(results, thresholds, root)
+
+    if blocking:
+        return 1
+    # A module that could not run has reviewed nothing. Default to letting the
+    # push through with a visible `?` rather than refusing it: a gate that
+    # fails closed on a network blip is a gate people learn to --no-verify
+    # past, which costs more than the review it was protecting.
+    if errored and args.strict:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

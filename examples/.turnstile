@@ -19,3 +19,31 @@ test: go test ./...
 #   TURNSTILE_CHANGED_FILES  newline-separated paths in that range
 #
 # changed-tests: go test $(echo "$TURNSTILE_CHANGED_FILES" | xargs -n1 dirname | sort -u)
+
+
+# ---------------------------------------------------------------- ai modules
+#
+#   ai <name>: block=<level> [model=<model>]
+#
+# Model-backed checks. These run in parallel with each other and with the
+# commands above, so they add wall-clock once rather than once per module.
+#
+# `block` is the lowest severity that refuses the push - low, medium, high,
+# critical, or `never` to report without ever blocking. Findings below the line
+# still print, marked `advisory`.
+#
+# Results are cached on a hash of the diff + the module's source, so re-pushing
+# the same commits is free. A module that cannot run prints `?` and lets the
+# push through rather than blocking on a network blip.
+
+ai review:  block=high
+ai secrets: block=medium
+
+# Two built-ins ship: `review` (correctness defects provable from the diff) and
+# `secrets` (credentials about to be published). Override either, or add your
+# own, by dropping a markdown file with frontmatter in:
+#
+#   .turnstile.d/modules/<name>.md    this repo only
+#   ~/.turnstile/modules/<name>.md    all your repos
+#
+# `turnstile status` prints which file each name actually resolved to.
