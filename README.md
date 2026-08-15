@@ -284,11 +284,33 @@ nothing else records it. It did not degrade. The reviewer reported the four
 real defects, and flagged none of the missing tests, the globals, or the
 unvalidated `argv` — the noise the objection predicted.
 
-So the live hypothesis is narrower than "review needs intent": intent matters
-when a decision is *unrecoverable from the diff and looks like a defect*.
-Absent structure alone does not produce that. Still small-n, and all three arms
-used the same model, so treat it as the reason this stage was unblocked rather
-than as a settled result.
+**Then it was run on someone's real work, and the objection finally landed.**
+Five commits from a mature Rust compiler (`beacon`), 300–700 diff lines each:
+
+| | result |
+|---|---|
+| 2 commits | no findings — correctly silent |
+| `critical` | bounds-check elision scan walks only top-level `body.stmts`, so a reassignment inside any nested block never invalidates. Elision removes the check entirely → silent out-of-bounds write. **Verified true.** |
+| `medium` | one `type_map.push(.., fty.name())` hover site missed by a diff whose whole point was routing type renders through `display_ty`. **Verified true**, three lines from its own fix. |
+| `high` | a use-after-free shape in `to_cstring`. Real — **and documented in the diff's own comment** as a known gap, "not patched here", tracked as issue #206. **False positive**, and a blocking one. |
+| `secrets`, all 5 | 0 findings |
+
+The false positive is the interesting one, because it inverts the original
+objection. Intent was not missing — it was written in a comment in the diff,
+the reviewer *read* it (the finding cites #206), and reported it as a defect
+anyway. The failure was not blindness to intent but refusal to defer to it.
+
+That is a prompt bug, not a design flaw, and it is fixed: `review` now treats a
+documented limitation as the author saying they already know, outranking its
+own reading of the code. Re-running the same three commits kept the `critical`
+and the `medium` and dropped the `high`.
+
+So the hypothesis, once more refined: a hook reviewer's noise does not come
+from lacking intent. It comes from overriding intent that is already on the
+page. Absent structure was harmless; a `TODO` it disagreed with was not.
+
+Still small-n and single-model. What is missing before any of this is
+trustworthy is an eval corpus — see below.
 
 **Prompts do most of the work.** The built-in modules spend more words on what
 *not* to report than on what to find, and the runner prepends a contract to
@@ -331,9 +353,12 @@ prototype that has to stay fast; `TURNSTILE_RANGE` and
 `TURNSTILE_CHANGED_FILES` are exported so a check can scope itself. Worktree
 isolation belongs with the review stage, where it actually buys something.
 
-**Unsolved: the first-ref-only shortcut.** `compute_range` gates the first
-content-bearing ref of a push and ignores the rest. Fine for `git push`, wrong
-for `--all`.
+**Every pushed ref is gated, in its own pass.** An earlier cut checked only the
+first content-bearing ref and warned about the rest, which was the wrong
+trade — a gate that reads as having checked three refs while checking one is
+worse than no gate. Multi-ref pushes are rare enough that repeating the
+deterministic checks costs nothing in practice, and the AI cache means an
+identical diff across two refs is not paid for twice.
 
 **Unsolved: the intent channel.** The `PreToolUse` hook fires inside a session
 that *does* know why a change was made, and could hand that to the review
@@ -342,10 +367,17 @@ it is worthless — the case it would help is precisely the one the probe could
 not construct, a deliberate decision that reads as a defect.
 
 **Unsolved: no eval.** Module prompts are tuned by reading their output on a
-handful of diffs. There is no corpus of diffs with known defects, so a prompt
-change that trades a true positive for a false negative is currently invisible.
-That is the next thing worth building, and it is what would turn the n=3 table
-above into something you could actually rely on.
+handful of diffs. The one prompt fix so far *was* checked against the three
+commits it had to keep getting right — but that is a regression test with n=3,
+run by hand, not an eval. A change that trades a true positive for a false
+negative on code nobody re-ran is still invisible.
+
+That is the honest ceiling on everything above. Until there is a corpus of
+diffs with known defects, every claim here is "it looked right on the diffs we
+tried", and prompt tuning stays a matter of taste. It is also the single most
+expensive thing left to build, which is why the recommendation is to run the
+cheap module everywhere and the expensive one advisory-only until it has
+earned more than n=8.
 
 ## Prior art
 

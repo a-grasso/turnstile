@@ -38,6 +38,14 @@ Do not report:
 - A choice that is coherent on its own terms. Code that is unusual is not
   therefore wrong; if you can construct a reason someone would write it
   deliberately, it is not a finding.
+- A limitation the diff itself documents as known. A comment saying "not fixed
+  here", a tracked issue number, a TODO naming the gap, a docstring stating the
+  required calling convention - that is the author telling you they already
+  know. Stated intent in the diff *is* intent, and it outranks your reading of
+  the code. Restating it back as a defect is the fastest way to be switched
+  off. Report it only if the stated reasoning is wrong on its own terms - not
+  merely because the hazard it describes is real. It usually is; that is why
+  they wrote it down.
 
 `file` and `line` must come from the diff's own headers, pointing at the
 post-change side. Prefer a small number of defensible findings over coverage.

@@ -146,9 +146,12 @@ ZERO="0000000000000000000000000000000000000000"
 # Sets: TURNSTILE_RANGE, TURNSTILE_LOCAL_SHA, TURNSTILE_REMOTE_SHA,
 #       TURNSTILE_CHANGED_FILES (newline separated)
 # Returns 1 when there is nothing to gate (branch deletion, or no refs at all).
-compute_range() {
-  local local_ref local_sha remote_ref remote_sha
-  local have_range=1
+# Emits one "<range><TAB><local_ref><TAB><local_sha><TAB><remote_sha>" line per
+# content-bearing ref. Every ref is emitted, not just the first: a gate that
+# checks one ref of three while reading as having checked all three is the one
+# failure mode that makes the whole thing worse than nothing.
+compute_ranges() {
+  local local_ref local_sha remote_ref remote_sha found=1
 
   # `|| [ -n "$local_ref" ]` so an unterminated final line is still processed
   # rather than being dropped at EOF.
@@ -157,32 +160,19 @@ compute_range() {
     # Deleting a remote branch pushes no content - nothing to validate.
     [ "$local_sha" = "$ZERO" ] && continue
 
-    if [ "$have_range" -eq 0 ]; then
-      # Prototype limit: only the first content-bearing ref is gated. Say so
-      # loudly - a gate that silently checks one ref of three reads as having
-      # checked all three. Checked before overwriting TURNSTILE_RANGE.
-      warn "turnstile: multi-ref push - only $TURNSTILE_RANGE checked, $local_ref was NOT"
-      continue
-    fi
-
+    local range
     if [ "$remote_sha" = "$ZERO" ] || [ -z "$remote_sha" ]; then
       # New remote branch: diff against the default branch when we can find
       # it, otherwise fall back to the last commit rather than the repo root.
       local base; base="$(default_base "$local_sha")"
-      TURNSTILE_RANGE="${base}..${local_sha}"
+      range="${base}..${local_sha}"
     else
-      TURNSTILE_RANGE="${remote_sha}..${local_sha}"
+      range="${remote_sha}..${local_sha}"
     fi
-    TURNSTILE_LOCAL_SHA="$local_sha"
-    TURNSTILE_REMOTE_SHA="$remote_sha"
-    have_range=0
+    printf '%s\t%s\t%s\t%s\n' "$range" "$local_ref" "$local_sha" "$remote_sha"
+    found=0
   done
-
-  [ "$have_range" -eq 0 ] || return 1
-
-  TURNSTILE_CHANGED_FILES="$(git diff --name-only "$TURNSTILE_RANGE" 2>/dev/null)"
-  export TURNSTILE_RANGE TURNSTILE_LOCAL_SHA TURNSTILE_REMOTE_SHA TURNSTILE_CHANGED_FILES
-  return 0
+  return $found
 }
 
 default_base() {
@@ -311,16 +301,37 @@ cmd_pre_push() {
     return 0
   fi
 
-  if ! compute_range; then
+  local -a ranges=() refs=()
+  local range ref lsha rsha
+  while IFS=$'\t' read -r range ref lsha rsha; do
+    ranges+=("$range"); refs+=("$ref")
+  done < <(compute_ranges)
+
+  if [ "${#ranges[@]}" -eq 0 ]; then
     dim "turnstile: nothing to validate (deletion or empty push)"
     return 0
   fi
 
-  run_checks "pre-push → ${1:-remote}"
-  local failures=$?
+  # Every pushed ref is gated, in its own pass. Rare enough that the repeated
+  # deterministic checks do not matter, and the AI cache means an identical
+  # diff across two refs is not paid for twice.
+  local failures=0 i degraded=0
+  for i in "${!ranges[@]}"; do
+    TURNSTILE_RANGE="${ranges[$i]}"
+    TURNSTILE_CHANGED_FILES="$(git diff --name-only "$TURNSTILE_RANGE" 2>/dev/null)"
+    export TURNSTILE_RANGE TURNSTILE_CHANGED_FILES
 
-  if [ "${TURNSTILE_AI_DEGRADED:-0}" -gt 0 ] && [ "$failures" -eq 0 ]; then
-    warn "turnstile: ${TURNSTILE_AI_DEGRADED} ai module(s) could not run - this push was NOT reviewed by them"
+    local label="pre-push → ${1:-remote}"
+    [ "${#ranges[@]}" -gt 1 ] && label="$label  [${refs[$i]}]"
+
+    TURNSTILE_AI_DEGRADED=0
+    run_checks "$label"
+    failures=$((failures + $?))
+    degraded=$((degraded + ${TURNSTILE_AI_DEGRADED:-0}))
+  done
+
+  if [ "$degraded" -gt 0 ] && [ "$failures" -eq 0 ]; then
+    warn "turnstile: $degraded ai module(s) could not run - this push was NOT reviewed by them"
   fi
 
   if [ "$failures" -gt 0 ]; then
