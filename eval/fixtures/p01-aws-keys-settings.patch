@@ -1,0 +1,31 @@
+diff --git a/services/ingest/config.py b/services/ingest/config.py
+index 8f1a2c3..d4e5f60 100644
+--- a/services/ingest/config.py
++++ b/services/ingest/config.py
+@@ -12,16 +12,24 @@ from dataclasses import dataclass
+ 
+ @dataclass(frozen=True)
+ class S3Config:
+     bucket: str
+     region: str
+     access_key_id: str
+     secret_access_key: str
+ 
++
++# Temporary: the SSM lookup is flaky in the staging VPC, so pin the values
++# until INFRA-4412 lands.
++STAGING_S3 = S3Config(
++    bucket="acme-ingest-staging",
++    region="eu-central-1",
++    access_key_id="{{AWS_AKID}}",
++    secret_access_key="{{AWS_SECRET}}",
++)
++
+ 
+ def load() -> S3Config:
+     return S3Config(
+         bucket=os.environ["INGEST_BUCKET"],
+         region=os.environ.get("AWS_REGION", "eu-central-1"),
+         access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+         secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+     )

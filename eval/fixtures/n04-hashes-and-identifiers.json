@@ -1,0 +1,8 @@
+{
+  "module": "secrets",
+  "kind": "negative",
+  "guard": "prompt-anchored",
+  "should_block": false,
+  "note": "High-entropy strings that are not credentials: package checksums, a UUID, a git SHA.",
+  "expect": []
+}

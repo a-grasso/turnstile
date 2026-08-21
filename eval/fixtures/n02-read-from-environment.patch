@@ -1,0 +1,24 @@
+diff --git a/services/mailer/smtp.py b/services/mailer/smtp.py
+index 5050505..6060606 100644
+--- a/services/mailer/smtp.py
++++ b/services/mailer/smtp.py
+@@ -1,18 +1,26 @@
+ import os
+ import smtplib
+ from email.message import EmailMessage
+ 
+ 
++def _credentials() -> tuple[str, str]:
++    username = os.environ["SMTP_USERNAME"]
++    password = os.environ["SMTP_PASSWORD"]
++    if not password:
++        raise RuntimeError("SMTP_PASSWORD is set but empty")
++    return username, password
++
++
+ def send(msg: EmailMessage) -> None:
++    username, password = _credentials()
+     with smtplib.SMTP_SSL(os.environ["SMTP_HOST"], 465) as server:
+-        server.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"])
++        server.login(username, password)
+         server.send_message(msg)

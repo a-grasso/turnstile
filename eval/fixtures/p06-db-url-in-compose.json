@@ -1,0 +1,9 @@
+{
+  "module": "secrets",
+  "kind": "positive",
+  "should_block": true,
+  "note": "Env-var indirection replaced with inline production connection strings carrying credentials.",
+  "expect": [
+    {"file": "docker-compose.prod.yml", "min_severity": "high", "what": "production DB and broker URLs with inline passwords"}
+  ]
+}

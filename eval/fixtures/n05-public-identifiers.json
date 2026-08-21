@@ -1,0 +1,8 @@
+{
+  "module": "secrets",
+  "kind": "negative",
+  "guard": "generalisation",
+  "should_block": false,
+  "note": "Secret-shaped but publishable by design: Sentry DSN, PKCE client id, Azure tenant id, Stripe publishable key. None of these are named in the module prompt - this is the probe for whether it reasons or pattern-matches.",
+  "expect": []
+}

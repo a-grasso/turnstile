@@ -1,0 +1,8 @@
+{
+  "module": "secrets",
+  "kind": "negative",
+  "guard": "prompt-anchored",
+  "should_block": false,
+  "note": "Obviously synthetic test values and an example.com address.",
+  "expect": []
+}

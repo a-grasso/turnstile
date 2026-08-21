@@ -1,0 +1,9 @@
+{
+  "module": "secrets",
+  "kind": "positive",
+  "should_block": true,
+  "note": "CI secret reference replaced by a literal GitHub PAT.",
+  "expect": [
+    {"file": ".github/workflows/publish.yml", "min_severity": "high", "what": "GitHub personal access token"}
+  ]
+}

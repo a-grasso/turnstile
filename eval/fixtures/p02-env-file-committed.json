@@ -1,0 +1,9 @@
+{
+  "module": "secrets",
+  "kind": "positive",
+  "should_block": true,
+  "note": "A real .env added to the tree: production DB URL with inline password, Django secret, live Stripe key.",
+  "expect": [
+    {"file": ".env", "min_severity": "critical", "what": "production database URL with password / live Stripe key"}
+  ]
+}

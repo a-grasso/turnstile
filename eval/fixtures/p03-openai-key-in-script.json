@@ -1,0 +1,9 @@
+{
+  "module": "secrets",
+  "kind": "positive",
+  "should_block": true,
+  "note": "Provider API key hardcoded, replacing the correct implicit-env constructor.",
+  "expect": [
+    {"file": "tools/summarise.py", "min_severity": "high", "what": "OpenAI API key"}
+  ]
+}

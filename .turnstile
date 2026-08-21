@@ -5,3 +5,8 @@ no-pyc:    ! git diff --cached --name-only --diff-filter=d | grep -q "\.pyc$"
 
 ai review:  block=high
 ai secrets: block=medium
+
+# `--diff-file` is the one source that does not need a repo. Guard the path
+# with a check that costs nothing: `--list` exercises the fallback without
+# reaching a model.
+no-repo:   (repo=$PWD; cd /tmp && python3 "$repo/bin/turnstile-ai" --diff-file /dev/null --module secrets --list >/dev/null)

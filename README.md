@@ -210,6 +210,7 @@ on `core.hooksPath`, so it works in repos that already have a hook manager:
 turnstile-ai --staged            # review the staged diff
 turnstile-ai --range main..HEAD  # review a range
 turnstile-ai --only secrets --json
+turnstile-ai --diff-file bug.patch --module secrets   # a diff from no repo at all
 ```
 
 For the [pre-commit](https://pre-commit.com) framework, this repo ships a
@@ -230,6 +231,29 @@ Pre-commit is the more aggressive placement: it fires on every commit rather
 than once per push, which multiplies both the latency and the bill. `secrets`
 is the module that earns it, since a secret is unrecoverable the moment it is
 pushed, and `review` is usually better left on pre-push.
+
+## Measuring a module
+
+A module is a prompt, and a prompt change is unfalsifiable without a corpus:
+removing a false positive you noticed can just as easily remove a true positive
+you never re-ran. [`eval/`](eval/) is the fixed set of diffs that makes the
+change measurable.
+
+```sh
+./eval/run.py --write                                   # score `secrets`, 3 runs each
+./eval/run.py --turnstile-home eval/probes/no-negatives # A/B against a variant prompt
+```
+
+It scores one thing - does the gate block this diff - because that is the only
+thing a module does to you. Findings below the block threshold are counted as
+noise rather than failure. Each fixture runs three times, since one pass of a
+non-deterministic call is not a measurement.
+
+The corpus is honest about its own weakness. `eval/probes/no-negatives` is the
+`secrets` prompt with its entire "Do not report" section deleted; it scores the
+same as the real prompt on all but one fixture. So a green scoreboard means "no
+regression detected by a weak instrument", not "the prompt is good". See
+[eval/README.md](eval/README.md).
 
 ## The global-hooksPath problem
 

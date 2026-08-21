@@ -1,0 +1,16 @@
+diff --git a/docker-compose.prod.yml b/docker-compose.prod.yml
+index 4455667..8899aab 100644
+--- a/docker-compose.prod.yml
++++ b/docker-compose.prod.yml
+@@ -6,16 +6,18 @@ services:
+   api:
+     image: registry.acme.io/ingest-api:${TAG}
+     restart: unless-stopped
+     environment:
+-      DATABASE_URL: ${DATABASE_URL}
+-      BROKER_URL: ${BROKER_URL}
++      DATABASE_URL: "postgres://ingest_rw:{{PG_PASSWORD}}@db-prod-01.acme-internal.net:5432/ingest?sslmode=require"
++      BROKER_URL: "amqps://svc_api:{{MQ_PASSWORD}}@mq-prod-01.acme-internal.net:5671/prod"
+       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel:4317
+     ports:
+       - "8080:8080"

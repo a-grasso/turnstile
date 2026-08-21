@@ -1,0 +1,8 @@
+{
+  "module": "secrets",
+  "kind": "negative",
+  "guard": "prompt-anchored",
+  "should_block": false,
+  "note": "Placeholder values in .env.example, including AWS's own documented example key. The module prompt names this case explicitly.",
+  "expect": []
+}

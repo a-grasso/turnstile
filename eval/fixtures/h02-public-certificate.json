@@ -1,0 +1,8 @@
+{
+  "module": "secrets",
+  "kind": "negative",
+  "guard": "hard",
+  "should_block": false,
+  "note": "A PEM block that is a public certificate, not a private key. Pattern-matching on -----BEGIN fires; reading the header does not.",
+  "expect": []
+}

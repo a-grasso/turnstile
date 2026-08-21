@@ -1,0 +1,9 @@
+{
+  "module": "secrets",
+  "kind": "positive",
+  "should_block": true,
+  "note": "Live-looking AWS access key id + secret pinned into a config module, next to the correct env-var pattern.",
+  "expect": [
+    {"file": "services/ingest/config.py", "min_severity": "high", "what": "AWS access key id and secret"}
+  ]
+}

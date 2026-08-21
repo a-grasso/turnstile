@@ -1,0 +1,14 @@
+diff --git a/.env.example b/.env.example
+index 3030303..4040404 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,8 +1,14 @@
+ # Copy to .env and fill in. Never commit the filled-in copy.
+ DATABASE_URL=postgres://user:changeme@localhost:5432/ingest
+ REDIS_URL=redis://localhost:6379/0
+ DJANGO_SECRET_KEY=your-secret-key-here
++STRIPE_SECRET_KEY=sk_test_xxxxxxxxxxxxxxxxxxxxxxxx
++AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
++AWS_SECRET_ACCESS_KEY=<REDACTED>
++SMTP_PASSWORD=changeme
+ LOG_LEVEL=debug

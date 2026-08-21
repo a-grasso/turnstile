@@ -1,0 +1,23 @@
+diff --git a/web/src/config.ts b/web/src/config.ts
+index d0d0d0d..e0e0e0e 100644
+--- a/web/src/config.ts
++++ b/web/src/config.ts
+@@ -1,12 +1,26 @@
+ export const config = {
+   apiBase: "https://api.acme.io/v2",
+   docsUrl: "https://docs.acme.io",
++
++  // Sentry's DSN is public by design - it is embedded in every browser bundle
++  // and only grants event ingestion.
++  sentryDsn: "https://4f2c1a9b8e7d6c5b4a39281706f5e4d3@o447951.ingest.sentry.io/5428371",
++
++  // Public OAuth client for the SPA; the flow is PKCE, there is no client secret.
++  oauth: {
++    clientId: "acme-web-spa-4f9c2a11",
++    authority: "https://login.microsoftonline.com/72f988bf-86f1-41af-91ab-2d7cd011db47",
++    redirectUri: "https://app.acme.io/auth/callback",
++  },
++
++  // Stripe publishable key - safe in client code.
++  stripePublishableKey: "pk_live_51H8xQ2LkdIwHu7ixZY9r2mVQ3nT8bC1aD4eF6gH7jK9lM0nP",
+ } as const;

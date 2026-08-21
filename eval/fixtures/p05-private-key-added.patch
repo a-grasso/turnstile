@@ -1,0 +1,21 @@
+diff --git a/deploy/keys/ci_deploy b/deploy/keys/ci_deploy
+new file mode 100644
+index 0000000..9e8d7c6
+--- /dev/null
++++ b/deploy/keys/ci_deploy
+@@ -0,0 +1,8 @@
++-----BEGIN OPENSSH PRIVATE KEY-----
++{{PEM_BODY_1}}
++{{PEM_BODY_2}}
++{{PEM_BODY_3}}
++-----END OPENSSH PRIVATE KEY-----
+diff --git a/deploy/rsync.sh b/deploy/rsync.sh
+index 2a3b4c5..6d7e8f9 100755
+--- a/deploy/rsync.sh
++++ b/deploy/rsync.sh
+@@ -3,8 +3,8 @@ set -euo pipefail
+ 
+ TARGET="${1:?usage: rsync.sh <host>}"
+ 
+-rsync -az --delete dist/ "deploy@${TARGET}:/srv/app/"
++rsync -az --delete -e "ssh -i deploy/keys/ci_deploy" dist/ "deploy@${TARGET}:/srv/app/"

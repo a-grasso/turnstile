@@ -1,0 +1,8 @@
+{
+  "module": "secrets",
+  "kind": "negative",
+  "guard": "hard",
+  "should_block": false,
+  "note": "A .env file added to the tree - which the prompt lists as reportable - holding only local test-stack defaults. Requires reading the comment and the localhost hosts rather than matching on the filename.",
+  "expect": []
+}

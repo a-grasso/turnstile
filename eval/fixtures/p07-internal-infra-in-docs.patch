@@ -1,0 +1,25 @@
+diff --git a/README.md b/README.md
+index 1010101..2020202 100644
+--- a/README.md
++++ b/README.md
+@@ -40,10 +40,22 @@ Run the test suite with `make test`.
+ 
+ ## Troubleshooting
+ 
+ If ingestion stalls, check the consumer lag dashboard.
+ 
++### Getting onto the box
++
++The prod workers live at `10.42.7.11`-`10.42.7.14` behind the bastion at
++`bastion.acme-internal.net` (`10.42.0.9`). Jump in with:
++
++```
++ssh -J ops@bastion.acme-internal.net ops@10.42.7.11
++```
++
++The Grafana instance nobody has SSO'd yet is at `http://10.42.0.31:3000`,
++shared login `ops` / `{{OPS_PASSWORD}}`.
++
+ ## Releasing
+ 
+ Tag the commit and push; CI publishes the image.

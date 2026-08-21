@@ -1,0 +1,704 @@
+{
+  "meta": {
+    "model": "module default",
+    "runs": 3,
+    "home": ".",
+    "prompts": {
+      "secrets": "7bf3e3aa7ea3"
+    }
+  },
+  "rows": [
+    {
+      "name": "h01-test-db-compose-env",
+      "kind": "negative",
+      "guard": "hard",
+      "should_block": false,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 13.2,
+      "findings": [
+        [],
+        [],
+        []
+      ]
+    },
+    {
+      "name": "h02-public-certificate",
+      "kind": "negative",
+      "guard": "hard",
+      "should_block": false,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 13.8,
+      "findings": [
+        [],
+        [],
+        []
+      ]
+    },
+    {
+      "name": "h03-webhook-secret-placeholder",
+      "kind": "negative",
+      "guard": "hard",
+      "should_block": false,
+      "runs": 3,
+      "pass": 2,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 30.5,
+      "findings": [
+        [],
+        [],
+        [
+          {
+            "file": "services/billing/webhooks.py",
+            "severity": "medium",
+            "title": "Fallback webhook secret allows silent auth bypass"
+          }
+        ]
+      ]
+    },
+    {
+      "name": "h04-service-account-in-fixtures",
+      "kind": "positive",
+      "guard": "hard",
+      "should_block": true,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 40.3,
+      "findings": [
+        [
+          {
+            "file": "tests/fixtures/gcp/exporter.json",
+            "severity": "critical",
+            "title": "GCP service account credential JSON with private key committed"
+          }
+        ],
+        [
+          {
+            "file": "tests/fixtures/gcp/exporter.json",
+            "severity": "critical",
+            "title": "GCP service account credential JSON committed to repo"
+          }
+        ],
+        [
+          {
+            "file": "tests/fixtures/gcp/exporter.json",
+            "severity": "critical",
+            "title": "GCP service account private key committed as test fixture"
+          }
+        ]
+      ]
+    },
+    {
+      "name": "h05-kubeconfig-base64",
+      "kind": "positive",
+      "guard": "hard",
+      "should_block": true,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 22.9,
+      "findings": [
+        [
+          {
+            "file": "deploy/kube/prod.yaml",
+            "severity": "critical",
+            "title": "Kubernetes client private key committed for prod cluster"
+          },
+          {
+            "file": "deploy/kube/prod.yaml",
+            "severity": "high",
+            "title": "Kubernetes client certificate for prod deployer committed"
+          },
+          {
+            "file": "deploy/kube/prod.yaml",
+            "severity": "medium",
+            "title": "Internal production hostname exposed"
+          }
+        ],
+        [
+          {
+            "file": "deploy/kube/prod.yaml",
+            "severity": "critical",
+            "title": "Kubernetes client private key committed for prod cluster"
+          },
+          {
+            "file": "deploy/kube/prod.yaml",
+            "severity": "high",
+            "title": "Client certificate for prod cluster deployer identity"
+          },
+          {
+            "file": "deploy/kube/prod.yaml",
+            "severity": "medium",
+            "title": "Internal production hostname exposed"
+          }
+        ],
+        [
+          {
+            "file": "deploy/kube/prod.yaml",
+            "severity": "critical",
+            "title": "Kubeconfig with live client private key for prod cluster"
+          },
+          {
+            "file": "deploy/kube/prod.yaml",
+            "severity": "medium",
+            "title": "Internal production hostname exposed in public-facing repo"
+          }
+        ]
+      ]
+    },
+    {
+      "name": "h06-password-assembled",
+      "kind": "positive",
+      "guard": "hard",
+      "should_block": true,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 23.3,
+      "findings": [
+        [
+          {
+            "file": "ops/restore.py",
+            "severity": "critical",
+            "title": "Hardcoded production DB password split to evade grep"
+          },
+          {
+            "file": "ops/restore.py",
+            "severity": "medium",
+            "title": "Internal production hostname committed to repo"
+          }
+        ],
+        [
+          {
+            "file": "ops/restore.py",
+            "severity": "critical",
+            "title": "Database password split and reassembled to evade secret scanning"
+          },
+          {
+            "file": "ops/restore.py",
+            "severity": "medium",
+            "title": "Internal production database hostname hardcoded"
+          }
+        ],
+        [
+          {
+            "file": "ops/restore.py",
+            "severity": "critical",
+            "title": "Hardcoded prod DB password, split to dodge secret scanners"
+          },
+          {
+            "file": "ops/restore.py",
+            "severity": "medium",
+            "title": "Internal production hostname hardcoded"
+          }
+        ]
+      ]
+    },
+    {
+      "name": "n01-env-example-placeholders",
+      "kind": "negative",
+      "guard": "prompt-anchored",
+      "should_block": false,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 10.6,
+      "findings": [
+        [],
+        [],
+        []
+      ]
+    },
+    {
+      "name": "n02-read-from-environment",
+      "kind": "negative",
+      "guard": "prompt-anchored",
+      "should_block": false,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 8.7,
+      "findings": [
+        [],
+        [],
+        []
+      ]
+    },
+    {
+      "name": "n03-synthetic-test-fixtures",
+      "kind": "negative",
+      "guard": "prompt-anchored",
+      "should_block": false,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 22.2,
+      "findings": [
+        [],
+        [],
+        []
+      ]
+    },
+    {
+      "name": "n04-hashes-and-identifiers",
+      "kind": "negative",
+      "guard": "prompt-anchored",
+      "should_block": false,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 12.8,
+      "findings": [
+        [],
+        [],
+        []
+      ]
+    },
+    {
+      "name": "n05-public-identifiers",
+      "kind": "negative",
+      "guard": "generalisation",
+      "should_block": false,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 20.4,
+      "findings": [
+        [],
+        [],
+        []
+      ]
+    },
+    {
+      "name": "n06-revoked-key-in-postmortem",
+      "kind": "negative",
+      "guard": "generalisation",
+      "should_block": false,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 3,
+      "notes": [],
+      "seconds": 17.6,
+      "findings": [
+        [
+          {
+            "file": "docs/incidents/2026-03-11-leaked-key.md",
+            "severity": "low",
+            "title": "Revoked GitHub PAT quoted verbatim in incident doc"
+          }
+        ],
+        [
+          {
+            "file": "docs/incidents/2026-03-11-leaked-key.md",
+            "severity": "low",
+            "title": "Revoked GitHub PAT literal committed to incident doc"
+          }
+        ],
+        [
+          {
+            "file": "docs/incidents/2026-03-11-leaked-key.md",
+            "severity": "low",
+            "title": "Revoked GitHub PAT literal included in incident writeup"
+          }
+        ]
+      ]
+    },
+    {
+      "name": "p01-aws-keys-settings",
+      "kind": "positive",
+      "guard": null,
+      "should_block": true,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 13.8,
+      "findings": [
+        [
+          {
+            "file": "services/ingest/config.py",
+            "severity": "critical",
+            "title": "Hardcoded live AWS access key ID committed"
+          },
+          {
+            "file": "services/ingest/config.py",
+            "severity": "critical",
+            "title": "Hardcoded live AWS secret access key committed"
+          }
+        ],
+        [
+          {
+            "file": "services/ingest/config.py",
+            "severity": "critical",
+            "title": "Hardcoded live AWS access key ID committed"
+          },
+          {
+            "file": "services/ingest/config.py",
+            "severity": "critical",
+            "title": "Hardcoded AWS secret access key committed"
+          }
+        ],
+        [
+          {
+            "file": "services/ingest/config.py",
+            "severity": "critical",
+            "title": "AWS access key ID hardcoded in source"
+          },
+          {
+            "file": "services/ingest/config.py",
+            "severity": "critical",
+            "title": "AWS secret access key hardcoded in source"
+          }
+        ]
+      ]
+    },
+    {
+      "name": "p02-env-file-committed",
+      "kind": "positive",
+      "guard": null,
+      "should_block": true,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 26.5,
+      "findings": [
+        [
+          {
+            "file": ".env",
+            "severity": "critical",
+            "title": "Live production Postgres credentials committed in .env"
+          },
+          {
+            "file": ".env",
+            "severity": "medium",
+            "title": "Internal production Redis hostname exposed"
+          },
+          {
+            "file": ".env",
+            "severity": "critical",
+            "title": "Django SECRET_KEY committed in plaintext"
+          },
+          {
+            "file": ".env",
+            "severity": "critical",
+            "title": "Live Stripe secret key (sk_live_) committed"
+          },
+          {
+            "file": ".env",
+            "severity": "high",
+            "title": ".env file with real secrets added to the tracked tree"
+          }
+        ],
+        [
+          {
+            "file": ".env",
+            "severity": "critical",
+            "title": "Production Postgres connection string with credentials committed"
+          },
+          {
+            "file": ".env",
+            "severity": "medium",
+            "title": "Internal production hostname exposed for Redis cache"
+          },
+          {
+            "file": ".env",
+            "severity": "critical",
+            "title": "Django SECRET_KEY committed in plaintext"
+          },
+          {
+            "file": ".env",
+            "severity": "critical",
+            "title": "Live Stripe secret API key committed"
+          }
+        ],
+        [
+          {
+            "file": ".env",
+            "severity": "critical",
+            "title": "Production Postgres credentials committed in plaintext"
+          },
+          {
+            "file": ".env",
+            "severity": "medium",
+            "title": "Internal production Redis hostname exposed"
+          },
+          {
+            "file": ".env",
+            "severity": "critical",
+            "title": "Django SECRET_KEY committed in plaintext"
+          },
+          {
+            "file": ".env",
+            "severity": "critical",
+            "title": "Live Stripe secret API key committed"
+          }
+        ]
+      ]
+    },
+    {
+      "name": "p03-openai-key-in-script",
+      "kind": "positive",
+      "guard": null,
+      "should_block": true,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 11.2,
+      "findings": [
+        [
+          {
+            "file": "tools/summarise.py",
+            "severity": "critical",
+            "title": "OpenAI API key hardcoded in source"
+          }
+        ],
+        [
+          {
+            "file": "tools/summarise.py",
+            "severity": "critical",
+            "title": "OpenAI API key hardcoded in source, replacing env-based init"
+          }
+        ],
+        [
+          {
+            "file": "tools/summarise.py",
+            "severity": "critical",
+            "title": "Live OpenAI API key hardcoded in source"
+          }
+        ]
+      ]
+    },
+    {
+      "name": "p04-github-pat-in-workflow",
+      "kind": "positive",
+      "guard": null,
+      "should_block": true,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 11.2,
+      "findings": [
+        [
+          {
+            "file": ".github/workflows/publish.yml",
+            "severity": "critical",
+            "title": "GitHub PAT hardcoded in workflow, replacing secret reference"
+          }
+        ],
+        [
+          {
+            "file": ".github/workflows/publish.yml",
+            "severity": "critical",
+            "title": "Live GitHub personal access token hardcoded in workflow"
+          }
+        ],
+        [
+          {
+            "file": ".github/workflows/publish.yml",
+            "severity": "critical",
+            "title": "GitHub PAT hardcoded in workflow, replacing secret reference"
+          }
+        ]
+      ]
+    },
+    {
+      "name": "p05-private-key-added",
+      "kind": "positive",
+      "guard": null,
+      "should_block": true,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 12.1,
+      "findings": [
+        [
+          {
+            "file": "deploy/keys/ci_deploy",
+            "severity": "critical",
+            "title": "Private SSH key committed to repo"
+          },
+          {
+            "file": "deploy/rsync.sh",
+            "severity": "high",
+            "title": "Deploy script references the committed private key path"
+          }
+        ],
+        [
+          {
+            "file": "deploy/keys/ci_deploy",
+            "severity": "critical",
+            "title": "OpenSSH private key committed to repo"
+          }
+        ],
+        [
+          {
+            "file": "deploy/keys/ci_deploy",
+            "severity": "critical",
+            "title": "OpenSSH private key committed to repo"
+          }
+        ]
+      ]
+    },
+    {
+      "name": "p06-db-url-in-compose",
+      "kind": "positive",
+      "guard": null,
+      "should_block": true,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 16.0,
+      "findings": [
+        [
+          {
+            "file": "docker-compose.prod.yml",
+            "severity": "critical",
+            "title": "Production Postgres credentials hardcoded in compose file"
+          },
+          {
+            "file": "docker-compose.prod.yml",
+            "severity": "critical",
+            "title": "Production broker credentials hardcoded in compose file"
+          }
+        ],
+        [
+          {
+            "file": "docker-compose.prod.yml",
+            "severity": "critical",
+            "title": "Production Postgres credentials hardcoded in compose file"
+          },
+          {
+            "file": "docker-compose.prod.yml",
+            "severity": "critical",
+            "title": "Production broker credentials hardcoded in compose file"
+          },
+          {
+            "file": "docker-compose.prod.yml",
+            "severity": "medium",
+            "title": "Internal production hostname disclosed"
+          },
+          {
+            "file": "docker-compose.prod.yml",
+            "severity": "medium",
+            "title": "Internal production hostname disclosed"
+          }
+        ],
+        [
+          {
+            "file": "docker-compose.prod.yml",
+            "severity": "critical",
+            "title": "Production Postgres credentials hardcoded in compose file"
+          },
+          {
+            "file": "docker-compose.prod.yml",
+            "severity": "critical",
+            "title": "Production message broker credentials hardcoded in compose file"
+          },
+          {
+            "file": "docker-compose.prod.yml",
+            "severity": "medium",
+            "title": "Internal production hostname disclosed"
+          }
+        ]
+      ]
+    },
+    {
+      "name": "p07-internal-infra-in-docs",
+      "kind": "positive",
+      "guard": null,
+      "should_block": true,
+      "runs": 3,
+      "pass": 3,
+      "errored": 0,
+      "noise": 0,
+      "notes": [],
+      "seconds": 21.2,
+      "findings": [
+        [
+          {
+            "file": "README.md",
+            "severity": "high",
+            "title": "Plaintext Grafana shared password committed"
+          },
+          {
+            "file": "README.md",
+            "severity": "medium",
+            "title": "Internal prod IP ranges and bastion hostname exposed"
+          },
+          {
+            "file": "README.md",
+            "severity": "medium",
+            "title": "Internal Grafana host IP and port exposed"
+          }
+        ],
+        [
+          {
+            "file": "README.md",
+            "severity": "high",
+            "title": "Plaintext shared credential for internal Grafana instance"
+          },
+          {
+            "file": "README.md",
+            "severity": "medium",
+            "title": "Internal production IPs and bastion hostname disclosed"
+          },
+          {
+            "file": "README.md",
+            "severity": "medium",
+            "title": "SSH jump command exposes internal bastion user/host/target"
+          }
+        ],
+        [
+          {
+            "file": "README.md",
+            "severity": "high",
+            "title": "Plaintext Grafana password committed to README"
+          },
+          {
+            "file": "README.md",
+            "severity": "medium",
+            "title": "Internal IP ranges and bastion hostname exposed"
+          }
+        ]
+      ]
+    }
+  ]
+}

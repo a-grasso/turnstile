@@ -1,0 +1,9 @@
+{
+  "module": "secrets",
+  "kind": "positive",
+  "should_block": true,
+  "note": "Private IP ranges, internal bastion hostname and a shared plaintext password in a public-facing README.",
+  "expect": [
+    {"file": "README.md", "min_severity": "medium", "what": "internal infrastructure detail plus a shared password"}
+  ]
+}

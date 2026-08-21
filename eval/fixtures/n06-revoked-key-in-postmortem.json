@@ -1,0 +1,9 @@
+{
+  "module": "secrets",
+  "kind": "negative",
+  "guard": "generalisation",
+  "should_block": false,
+  "allow_max_severity": "low",
+  "note": "A key-shaped literal that the surrounding prose states is revoked. The prompt grades a neutralised secret as low, which is below the medium block threshold - so reporting it is fine, blocking on it is not.",
+  "expect": []
+}

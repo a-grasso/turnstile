@@ -1,0 +1,21 @@
+diff --git a/docs/incidents/2026-03-11-leaked-key.md b/docs/incidents/2026-03-11-leaked-key.md
+new file mode 100644
+index 0000000..f0f0f0f
+--- /dev/null
++++ b/docs/incidents/2026-03-11-leaked-key.md
+@@ -0,0 +1,14 @@
++# 2026-03-11 - deploy key leaked to a public fork
++
++## What happened
++
++The CI deploy token `{{GH_PAT_REVOKED}}` was committed to `publish.yml` and
++pushed to a public fork. GitHub's secret scanner revoked it automatically
++within 90 seconds; we confirmed revocation and rotated it the same hour.
++
++## Why it is quoted here
++
++The token is dead. It is recorded so the audit trail matches the scanner alert.
++
++## Follow-up
++
++Move publish credentials to OIDC so there is no long-lived token to leak.

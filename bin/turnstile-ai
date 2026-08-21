@@ -186,8 +186,36 @@ def default_range(root: str) -> str:
     return "4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD"
 
 
-def diff_for(range_spec: str | None, staged: bool, root: str) -> tuple[str, list[str]]:
+DIFF_FILE_HEADER = re.compile(r"^\+\+\+ (?:b/)?(.+)$", re.MULTILINE)
+
+
+def diff_from_file(path: str) -> tuple[str, list[str]]:
+    """Reads a diff from a file (or stdin for '-') instead of from git.
+
+    Exists so a module can be run against a diff that is not in any repo's
+    history: a saved patch, a fixture in an eval corpus, a diff piped in from
+    another tool. Without it, the only way to measure a prompt change is to
+    re-run it against live commits, which is not a measurement.
+    """
+    if path == "-":
+        diff = sys.stdin.read()
+    else:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            diff = fh.read()
+
+    files = []
+    for name in DIFF_FILE_HEADER.findall(diff):
+        name = name.split("\t")[0].strip()
+        if name and name != "/dev/null" and name not in files:
+            files.append(name)
+    return diff, files
+
+
+def diff_for(range_spec: str | None, staged: bool, root: str,
+             diff_file: str | None = None) -> tuple[str, list[str]]:
     """Returns (diff text, changed files)."""
+    if diff_file:
+        return diff_from_file(diff_file)
     if staged:
         args = ["diff", "--cached"]
     else:
@@ -648,8 +676,13 @@ def main(argv: list[str]) -> int:
                      help="git range to review (what pre-push passes)")
     src.add_argument("--staged", action="store_true",
                      help="review the staged diff (for a pre-commit hook)")
+    src.add_argument("--diff-file", dest="diff_file", metavar="PATH",
+                     help="review a diff read from a file, or '-' for stdin")
     p.add_argument("--only", action="append", metavar="NAME",
                    help="run just this module (repeatable)")
+    p.add_argument("--module", action="append", metavar="NAME",
+                   help="run this module regardless of .turnstile (repeatable). "
+                        "Blocking level comes from the module's own frontmatter.")
     # No default: resolve_model has to be able to tell "asked for a model" from
     # "did not", so that a module's declared default is not shadowed by one.
     p.add_argument("--model", default=None,
@@ -668,8 +701,16 @@ def main(argv: list[str]) -> int:
     try:
         root = repo_root()
     except TurnstileError as e:
-        warn(str(e))
-        return 2 if args.strict else 0
+        # `--diff-file` is the one source that does not come from git, so it is
+        # the one case where not being in a repo is not an error. `root` still
+        # has jobs to do - it is where `.turnstile` and repo-local module
+        # overrides are looked for, and the cwd the model runs in - so fall
+        # back to the working directory rather than threading an optional root
+        # through everything downstream.
+        if not args.diff_file:
+            warn(str(e))
+            return 2 if args.strict else 0
+        root = os.getcwd()
 
     if args.prune_cache:
         say(f"  pruned {cache_prune()} cache entries")
@@ -686,7 +727,13 @@ def main(argv: list[str]) -> int:
     if config_errors and args.strict:
         return 2
 
-    if args.only:
+    # `--module` declares what to run, rather than filtering what the repo
+    # already declared. A corpus run has to be able to exercise a module in a
+    # repo whose `.turnstile` does not mention it - otherwise the eval measures
+    # the config as much as the prompt.
+    if args.module:
+        checks = [{"name": name, "opts": {}, "lineno": 0} for name in args.module]
+    elif args.only:
         checks = [c for c in checks if c["name"] in args.only]
 
     if not checks:
@@ -717,8 +764,8 @@ def main(argv: list[str]) -> int:
         return 2
 
     try:
-        diff, changed = diff_for(args.range_spec, args.staged, root)
-    except TurnstileError as e:
+        diff, changed = diff_for(args.range_spec, args.staged, root, args.diff_file)
+    except (TurnstileError, OSError) as e:
         warn(f"turnstile-ai: {e}")
         return 2 if args.strict else 0
 
@@ -759,7 +806,7 @@ def main(argv: list[str]) -> int:
     if args.json:
         json.dump(
             {
-                "range": args.range_spec or "staged",
+                "range": args.range_spec or (args.diff_file and f"file:{args.diff_file}") or "staged",
                 "changed_files": changed,
                 "results": results,
                 "blocking": [

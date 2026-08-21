@@ -1,0 +1,9 @@
+{
+  "module": "secrets",
+  "kind": "positive",
+  "should_block": true,
+  "note": "An SSH private key file added to the tree and wired into the deploy script.",
+  "expect": [
+    {"file": "deploy/keys/ci_deploy", "min_severity": "critical", "what": "OpenSSH private key"}
+  ]
+}

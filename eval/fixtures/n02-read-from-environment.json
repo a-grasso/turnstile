@@ -1,0 +1,8 @@
+{
+  "module": "secrets",
+  "kind": "negative",
+  "guard": "prompt-anchored",
+  "should_block": false,
+  "note": "Variables named password/secret holding no literal - the correct env-var pattern, which the prompt tells the module not to report.",
+  "expect": []
+}

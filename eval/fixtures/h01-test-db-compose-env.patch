@@ -1,0 +1,13 @@
+diff --git a/.env.test b/.env.test
+new file mode 100644
+index 0000000..b1b1b1b
+--- /dev/null
++++ b/.env.test
+@@ -0,0 +1,7 @@
++# Values for the throwaway compose stack in `make test`. Committed on purpose:
++# CI and laptops must agree, and none of it leaves the docker network.
++POSTGRES_PASSWORD=postgres
++DATABASE_URL=postgres://postgres:postgres@localhost:5433/ingest_test
++JWT_SIGNING_KEY=test-signing-key-not-used-in-prod
++S3_ENDPOINT=http://localhost:9000
++S3_SECRET_KEY=minioadmin

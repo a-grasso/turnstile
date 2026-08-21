@@ -1,0 +1,29 @@
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+index 7070707..8080808 100644
+--- a/tests/test_auth.py
++++ b/tests/test_auth.py
+@@ -1,14 +1,32 @@
+ import pytest
+ 
+ from services.auth import verify_bearer, hash_password
+ 
++FAKE_TOKEN = "test-token"
++FAKE_PASSWORD = "hunter2"
++FAKE_JWT = "aaaa.bbbb.cccc"
++
++
++@pytest.fixture
++def user():
++    return {"email": "alice@example.com", "password": FAKE_PASSWORD}
++
++
++def test_rejects_garbage_bearer():
++    assert verify_bearer("Bearer " + FAKE_JWT) is None
++
++
++def test_hash_is_not_the_password(user):
++    assert hash_password(user["password"]) != user["password"]
++
+ 
+ def test_placeholder():
+     assert True

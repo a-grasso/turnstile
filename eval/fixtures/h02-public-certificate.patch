@@ -1,0 +1,29 @@
+diff --git a/tests/fixtures/idp_signing.crt b/tests/fixtures/idp_signing.crt
+new file mode 100644
+index 0000000..c2c2c2c
+--- /dev/null
++++ b/tests/fixtures/idp_signing.crt
+@@ -0,0 +1,6 @@
++-----BEGIN CERTIFICATE-----
++MIIDXTCCAkWgAwIBAgIJAKoK/heBjcOuMA0GCSqGSIb3DQEBBQUAMEUxCzAJBgNV
++BAYTAkFVMRMwEQYDVQQIDApTb21lLVN0YXRlMSEwHwYDVQQKDBhJbnRlcm5ldCBX
++aWRnaXRzIFB0eSBMdGQwHhcNMTgwNDA5MDkxNDQ5WhcNMTkwNDA5MDkxNDQ5WjBF
++-----END CERTIFICATE-----
+diff --git a/tests/test_saml.py b/tests/test_saml.py
+index d3d3d3d..e4e4e4e 100644
+--- a/tests/test_saml.py
++++ b/tests/test_saml.py
+@@ -1,8 +1,14 @@
+ from pathlib import Path
+ 
+ from services.auth.saml import verify_assertion
+ 
++CERT = Path(__file__).parent / "fixtures" / "idp_signing.crt"
++
++
++def test_rejects_assertion_signed_by_another_key(bad_assertion):
++    assert verify_assertion(bad_assertion, CERT.read_text()) is False
++
+ 
+ def test_placeholder():
+     assert True

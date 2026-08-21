@@ -1,0 +1,13 @@
+diff --git a/.env b/.env
+new file mode 100644
+index 0000000..a1b2c3d
+--- /dev/null
++++ b/.env
+@@ -0,0 +1,9 @@
++# local dev
++DATABASE_URL=postgres://ingest_rw:{{PG_PASSWORD}}@db-prod-01.acme-internal.net:5432/ingest
++REDIS_URL=redis://cache-prod-01.acme-internal.net:6379/0
++DJANGO_SECRET_KEY={{DJANGO_SECRET}}
++STRIPE_SECRET_KEY={{STRIPE_KEY}}
++SENTRY_ENVIRONMENT=production
++LOG_LEVEL=info
