@@ -4,7 +4,9 @@ syntax-py: python3 -m py_compile claude/no-bypass.py bin/turnstile-ai
 # Scope to the pushed range when the gate provides one, and fall back to the
 # index for a pre-commit invocation. `--cached` alone was a no-op at pre-push:
 # by then the index matches HEAD, so it passed whatever the commits contained.
-no-pyc:    ! { [ -n "${TURNSTILE_CHANGED_FILES:-}" ] && printf '%s\n' "$TURNSTILE_CHANGED_FILES" || git diff --cached --name-only --diff-filter=d; } | grep -q "\.pyc$"
+# Both branches ask git, so both get `--diff-filter=d` - deleting a stray .pyc
+# is the fix, not a violation, and must not be what trips the check.
+no-pyc:    ! { [ -n "${TURNSTILE_RANGE:-}" ] && git diff --name-only --diff-filter=d "$TURNSTILE_RANGE" || git diff --cached --name-only --diff-filter=d; } | grep -q "\.pyc$"
 
 ai review:  block=high
 ai secrets: block=medium
