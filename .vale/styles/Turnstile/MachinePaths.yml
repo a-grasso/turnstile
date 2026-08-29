@@ -1,0 +1,9 @@
+extends: existence
+message: "Machine-specific path '%s' in docs. Use ~, $HOME, or a placeholder."
+level: error
+scope: raw
+nonword: true
+tokens:
+  - '/Users/[A-Za-z0-9._-]+'
+  - '/home/[A-Za-z0-9._-]+'
+  - '[A-Z]:\\Users\\[A-Za-z0-9._-]+'

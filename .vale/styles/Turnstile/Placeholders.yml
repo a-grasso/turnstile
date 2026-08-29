@@ -1,0 +1,8 @@
+extends: existence
+message: "Unresolved placeholder '%s' in published docs."
+level: error
+nonword: true
+tokens:
+  - '\b(TODO|FIXME|TBD|XXX|HACK)\s*[:(]'
+  - '\blorem ipsum\b'
+  - '\bcoming soon\b'

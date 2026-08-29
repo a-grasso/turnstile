@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# vale: the pinned style package is fetched by `vale sync`, the house style
+# under Turnstile/ is source.
+/.vale/styles/*
+!/.vale/styles/Turnstile/

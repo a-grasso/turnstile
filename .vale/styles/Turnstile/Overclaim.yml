@@ -1,0 +1,13 @@
+extends: existence
+message: "'%s' overclaims. turnstile is a prototype and explicitly not a security boundary."
+level: error
+ignorecase: true
+tokens:
+  - 'production[- ]ready'
+  - 'battle[- ]tested'
+  - 'enterprise[- ]grade'
+  - 'bulletproof'
+  - 'fully secure'
+  - 'guarantees? (safety|security|correctness)'
+  - '(100%|completely|totally) (secure|reliable|safe)'
+  - 'cannot be bypassed'

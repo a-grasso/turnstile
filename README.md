@@ -26,7 +26,7 @@ A mechanical gate on the push path.
 ```
 
 Not a skill. Not an agent. A `pre-push` hook that runs the repo's own checks
-and refuses the push if they fail — because the code path was taken, not
+and refuses the push if they fail, because the code path was taken, not
 because a model decided the moment was relevant.
 
 **Status: prototype.** Two evenings old, unproven in daily use. The
@@ -49,7 +49,7 @@ Two enforcement points, covering different traffic:
 | `pre-push` hook | you, agents, the IDE, anything calling git | a human typing `--no-verify` |
 | `PreToolUse` hook | Claude Code's Bash tool | you, by editing settings.json |
 
-The pair matters. `--no-verify` is the right escape hatch for a person — they
+The pair matters. `--no-verify` is the right escape hatch for a person: they
 have decided to take responsibility. It is the wrong one for an agent, which
 has decided nothing and is routing around a failing check because that makes
 the task look finished. So the second hook closes it, for the agent only.
@@ -59,7 +59,7 @@ string, so `sh -c` wrapping, quote splitting, an alias, or a helper script that
 calls `git push --no-verify` itself all walk straight past it. It raises the
 cost of an accidental bypass from zero to deliberate; it is not a security
 boundary and cannot become one at this layer. The `pre-push` hook is the actual
-gate — this only stops the model from reflexively reaching for the hatch.
+gate. This only stops the model from reflexively reaching for the hatch.
 
 ## Install
 
@@ -92,8 +92,8 @@ ai secrets: block=medium
 Repos without one pass straight through. See [examples/.turnstile](examples/.turnstile).
 
 For the agent-side half, point a Claude Code `PreToolUse` hook at
-[claude/no-bypass.py](claude/no-bypass.py) — the docstring has the settings.json
-block.
+[claude/no-bypass.py](claude/no-bypass.py). The docstring has the
+settings.json block.
 
 Undo everything with `turnstile uninstall`.
 
@@ -164,7 +164,7 @@ So a repo can override `review` for its own conventions without forking, and
 Modules do not return text that gets grepped. The runner passes a JSON schema
 to the model and reads back validated objects with `file`, `line`, `severity`,
 `title`, and `detail`. A module that returns nothing schema-conforming is an
-error, not a silently-empty pass — parsing prose for verdicts is the failure
+error, not a silently-empty pass. Parsing prose for verdicts is the failure
 mode this exists to avoid.
 
 ### Cost, and the cache
@@ -191,9 +191,9 @@ is stated in the report rather than silently narrowing what was reviewed. A
 module that overruns `TURNSTILE_AI_TIMEOUT` (default 300s) is killed as a
 process group, because a hook that hangs is worse than one that fails.
 
-When a module is skipped this way, the summary says so — `all checks passed
-(1 ai module(s) could not run)` — rather than reporting a clean pass for a
-review that never happened.
+When a module is skipped this way, the summary says so, printing `all checks
+passed (1 ai module(s) could not run)` rather than reporting a clean pass for
+a review that never happened.
 
 ```
 TURNSTILE_MODEL         default model for all modules (default: sonnet)
@@ -224,7 +224,7 @@ repos:
       - id: turnstile-ai
 ```
 
-The module list still comes from the repo's `.turnstile` either way — the hook
+The module list still comes from the repo's `.turnstile` either way: the hook
 manager decides *when* the runner fires, never *what* it runs.
 
 Pre-commit is the more aggressive placement: it fires on every commit rather
@@ -255,6 +255,45 @@ same as the real prompt on all but one fixture. So a green scoreboard means "no
 regression detected by a weak instrument", not "the prompt is good". See
 [eval/README.md](eval/README.md).
 
+## Gating the prose
+
+This repo runs [vale](https://vale.sh) over its own docs, as an ordinary
+deterministic check rather than an ai module. The house rule is "no em dashes",
+which is a rule, so a linter enforces it perfectly and a model would only
+approximate it.
+
+```sh
+vale sync          # fetch the pinned style package into .vale/styles
+vale README.md     # everything, including the advisory suggestions
+turnstile run      # only what gates, only on the files the push carries
+```
+
+[.vale.ini](.vale.ini) gates two rules out of [ai-tells](https://github.com/tbhb/vale-ai-tells)'
+78 and demotes the other 76 to suggestions, because gating all of them means a
+stray "comprehensive" refuses a push. On top of that sits a small house style in
+[.vale/styles/Turnstile](.vale/styles/Turnstile): no machine-specific paths, no
+real addresses or private ranges, no unresolved `TODO:`, and no claiming
+`production-ready` when the second line of this file says prototype. One rule,
+`PromptContract`, watches [modules/](modules/) rather than the docs: it fails if
+a module prompt has lost its "not a finding" guidance entirely, which is the
+one prompt regression [eval/](eval/) has already admitted it cannot see.
+
+Three things about the placement are worth knowing, because none of them are
+obvious from vale's own docs:
+
+- **The check reads `TURNSTILE_CHANGED_FILES`**, which is the hook-side
+  equivalent of vale's `filter_mode: file`. A page you never touch stays as it
+  is; a page you edit you leave clean. There is no equivalent of `added`, since
+  a check reports one exit code and not a set of lines.
+- **A failing check is shown as `tail -n 40`.** Left at the config's
+  `MinAlertLevel`, forty advisory suggestions push the violation that actually
+  blocked the push out of the window, so the check runs at
+  `--minAlertLevel=error` and the suggestions stay a manual `vale` away.
+- **Missing vale fails the check** rather than skipping it. Fail-open is for the
+  ai modules, where the alternative teaches people to `--no-verify` past a
+  network blip. A linter that is simply not installed is a broken gate, and a
+  gate that disappears when its tool does is worse than not having it.
+
 ## The global-hooksPath problem
 
 Git has no hook-chaining and no per-repo layering: a global `core.hooksPath`
@@ -263,7 +302,7 @@ every existing hook on the machine.
 
 So `install` does not drop in one `pre-push`. It symlinks
 [hooks/dispatch](hooks/dispatch) as *every* client-side hook name, and the
-dispatcher's second job — before anything else — is to delegate to the repo's
+dispatcher's second job, before anything else, is to delegate to the repo's
 own `.git/hooks/<name>`, replaying `pre-push`'s stdin so the delegate sees the
 same ref updates. Adding a hook name to the list in `bin/turnstile` is the
 contract, not a convenience: a name missing from it is a hook that stops firing
@@ -280,7 +319,7 @@ Two cases it deliberately does not fight:
 
 ## Design notes
 
-**Deterministic checks stay the floor.** `make lint`, `go test` — fast, free,
+**Deterministic checks stay the floor.** `make lint`, `go test`: fast, free,
 never wrong, never annoying. They cover the boring majority of what a gate
 should catch: broken build, failing test, lint drift. The AI modules are added
 on top of that floor, never in place of it. A model is the wrong tool for
@@ -289,7 +328,7 @@ anything a compiler can already decide.
 **The model in the push path had one real objection**, and it was not cost or
 latency: *a git hook knows the diff but not the intent*. A reviewer without
 intent flags every deliberate decision as a mistake, and after two of those you
-stop reading the findings — at which point the gate costs you time and trains
+stop reading the findings, at which point the gate costs you time and trains
 you to ignore it.
 
 That objection was probed three times before the stage was built, each an arm
@@ -297,30 +336,30 @@ of `claude -p` given the diff and nothing else:
 
 | diff | findings | false positives |
 |---|---|---|
-| turnstile's own 852-line initial commit (new code) | 5 | 0 — two were real bugs (committed `.pyc`, dead `.gitignore` entry) |
-| `reflock@8f884e6` (modifies existing code; its whole point is a deliberate "do **not** auto-repair" decision that should bait a false positive) | 1 | 0 — real string drift between two copies meant to stay in sync |
-| a 61-line script with **no tests and no structure**: module-level globals, no argv validation, bare `except`, env-var token | 5 | 0 — shell injection via `os.system`, a `cp` reading the wrong path, an unclosed file, a division by zero on empty input, one internal hostname |
+| turnstile's own 852-line initial commit (new code) | 5 | 0. Two were real bugs (committed `.pyc`, dead `.gitignore` entry) |
+| `reflock@8f884e6` (modifies existing code; its whole point is a deliberate "do **not** auto-repair" decision that should bait a false positive) | 1 | 0. Real string drift between two copies meant to stay in sync |
+| a 61-line script with **no tests and no structure**: module-level globals, no argv validation, bare `except`, env-var token | 5 | 0. Shell injection via `os.system`, a `cp` reading the wrong path, an unclosed file, a division by zero on empty input, one internal hostname |
 
 The third was chosen because the first two shared a weakness: both were code
 where tests and structure already encoded the *why*, which is the easy case.
 The hypothesis worth falsifying was that intent matters most exactly where
 nothing else records it. It did not degrade. The reviewer reported the four
 real defects, and flagged none of the missing tests, the globals, or the
-unvalidated `argv` — the noise the objection predicted.
+unvalidated `argv`, the noise the objection predicted.
 
 **Then it was run on someone's real work, and the objection finally landed.**
-Five commits from a mature Rust compiler (`beacon`), 300–700 diff lines each:
+Five commits from a mature Rust compiler (`beacon`), 300-700 diff lines each:
 
 | | result |
 |---|---|
-| 2 commits | no findings — correctly silent |
+| 2 commits | no findings, correctly silent |
 | `critical` | bounds-check elision scan walks only top-level `body.stmts`, so a reassignment inside any nested block never invalidates. Elision removes the check entirely → silent out-of-bounds write. **Verified true.** |
 | `medium` | one `type_map.push(.., fty.name())` hover site missed by a diff whose whole point was routing type renders through `display_ty`. **Verified true**, three lines from its own fix. |
-| `high` | a use-after-free shape in `to_cstring`. Real — **and documented in the diff's own comment** as a known gap, "not patched here", tracked as issue #206. **False positive**, and a blocking one. |
+| `high` | a use-after-free shape in `to_cstring`. Real, **and documented in the diff's own comment** as a known gap, "not patched here", tracked as issue #206. **False positive**, and a blocking one. |
 | `secrets`, all 5 | 0 findings |
 
 The false positive is the interesting one, because it inverts the original
-objection. Intent was not missing — it was written in a comment in the diff,
+objection. Intent was not missing. It was written in a comment in the diff,
 the reviewer *read* it (the finding cites #206), and reported it as a defect
 anyway. The failure was not blindness to intent but refusal to defer to it.
 
@@ -334,7 +373,7 @@ from lacking intent. It comes from overriding intent that is already on the
 page. Absent structure was harmless; a `TODO` it disagreed with was not.
 
 Still small-n and single-model. What is missing before any of this is
-trustworthy is an eval corpus — see below.
+trustworthy is an eval corpus (see below).
 
 **Prompts do most of the work.** The built-in modules spend more words on what
 *not* to report than on what to find, and the runner prepends a contract to
@@ -344,11 +383,11 @@ not a wasted minute, it is the author learning to ignore the gate.
 
 **Blocking is a per-module decision, not a global one.** `secrets` blocks at
 `medium` and `review` at `high` in the same file, because the two failure modes
-are not comparable — a pushed secret is unrecoverable, a missed correctness
+are not comparable: a pushed secret is unrecoverable, a missed correctness
 finding is a bug report. Anything below the line still prints, so lowering the
 bar costs nothing but reading.
 
-**Frontmatter is not YAML** — flat `key: value`, same reasoning as the
+**Frontmatter is not YAML.** Flat `key: value`, same reasoning as the
 line-oriented `.turnstile` format. No dependency, and a format that can only
 express flat strings cannot grow into a second configuration language.
 
@@ -379,7 +418,7 @@ isolation belongs with the review stage, where it actually buys something.
 
 **Every pushed ref is gated, in its own pass.** An earlier cut checked only the
 first content-bearing ref and warned about the rest, which was the wrong
-trade — a gate that reads as having checked three refs while checking one is
+trade: a gate that reads as having checked three refs while checking one is
 worse than no gate. Multi-ref pushes are rare enough that repeating the
 deterministic checks costs nothing in practice, and the AI cache means an
 identical diff across two refs is not paid for twice.
@@ -387,12 +426,12 @@ identical diff across two refs is not paid for twice.
 **Unsolved: the intent channel.** The `PreToolUse` hook fires inside a session
 that *does* know why a change was made, and could hand that to the review
 stage. The probe above is the reason that is not urgent any more, not a reason
-it is worthless — the case it would help is precisely the one the probe could
+it is worthless. The case it would help is precisely the one the probe could
 not construct, a deliberate decision that reads as a defect.
 
 **Unsolved: no eval.** Module prompts are tuned by reading their output on a
 handful of diffs. The one prompt fix so far *was* checked against the three
-commits it had to keep getting right — but that is a regression test with n=3,
+commits it had to keep getting right, but that is a regression test with n=3,
 run by hand, not an eval. A change that trades a true positive for a false
 negative on code nobody re-ran is still invisible.
 

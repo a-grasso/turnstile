@@ -1,0 +1,11 @@
+extends: existence
+message: "'%s' looks like private infrastructure or a real address. Scrub it before publishing."
+level: error
+scope: raw
+nonword: true
+tokens:
+  - '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+  - '\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
+  - '\b192\.168\.\d{1,3}\.\d{1,3}\b'
+  - '\b172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b'
+  - '\b[a-z0-9-]+\.(internal|intranet|corp|lan)\b'

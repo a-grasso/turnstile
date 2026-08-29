@@ -1,0 +1,12 @@
+extends: substitution
+message: "Use turnstile's own vocabulary: '%s', not '%s'."
+level: suggestion
+ignorecase: false
+swap:
+  'pre push': 'pre-push'
+  'prepush': 'pre-push'
+  'pre commit': 'pre-commit'
+  'precommit': 'pre-commit'
+  'hooks path': 'hooksPath'
+  'hookspath': 'hooksPath'
+  'Turnstile': 'turnstile'

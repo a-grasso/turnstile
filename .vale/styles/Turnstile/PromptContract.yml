@@ -1,0 +1,7 @@
+extends: occurrence
+message: "This module prompt has no 'not a finding' guidance left in it."
+level: error
+scope: raw
+ignorecase: true
+min: 1
+token: 'not a finding'
