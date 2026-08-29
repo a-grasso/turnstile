@@ -1,5 +1,5 @@
 extends: occurrence
-message: "Sentence runs past 45 words. Split it."
+message: "Sentence runs past 35 words. Split it."
 level: suggestion
 scope: sentence
 max: 35
