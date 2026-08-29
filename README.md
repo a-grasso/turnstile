@@ -89,10 +89,10 @@ ai review:  block=high
 ai secrets: block=medium
 ```
 
-Repos without one pass straight through. See [examples/.turnstile](examples/.turnstile).
+Repos without one pass straight through. See [examples/.turnstile](examples/.turnstile)<!--@13caced8-->.
 
 For the agent-side half, point a Claude Code `PreToolUse` hook at
-[claude/no-bypass.py](claude/no-bypass.py). The docstring has the
+[claude/no-bypass.py](claude/no-bypass.py)<!--@360addfc-->. The docstring has the
 settings.json block.
 
 Undo everything with `turnstile uninstall`.
@@ -214,7 +214,7 @@ turnstile-ai --diff-file bug.patch --module secrets   # a diff from no repo at a
 ```
 
 For the [pre-commit](https://pre-commit.com) framework, this repo ships a
-[`.pre-commit-hooks.yaml`](.pre-commit-hooks.yaml):
+[`.pre-commit-hooks.yaml`](.pre-commit-hooks.yaml)<!--@d2bb34b9-->:
 
 ```yaml
 repos:
@@ -253,7 +253,7 @@ The corpus is honest about its own weakness. `eval/probes/no-negatives` is the
 `secrets` prompt with its entire "Do not report" section deleted; it scores the
 same as the real prompt on all but one fixture. So a green scoreboard means "no
 regression detected by a weak instrument", not "the prompt is good". See
-[eval/README.md](eval/README.md).
+[eval/README.md](eval/README.md)<!--@3e92c5a5-->.
 
 ## Gating the prose
 
@@ -268,7 +268,7 @@ vale README.md     # everything, including the advisory suggestions
 turnstile run      # only what gates, only on the files the push carries
 ```
 
-[.vale.ini](.vale.ini) gates two rules out of [ai-tells](https://github.com/tbhb/vale-ai-tells)'
+[.vale.ini](.vale.ini)<!--@31ec1305--> gates two rules out of [ai-tells](https://github.com/tbhb/vale-ai-tells)'
 78 and demotes the other 76 to suggestions, because gating all of them means a
 stray "comprehensive" refuses a push. On top of that sits a small house style in
 [.vale/styles/Turnstile](.vale/styles/Turnstile): no machine-specific paths, no
@@ -294,6 +294,37 @@ obvious from vale's own docs:
   network blip. A linter that is simply not installed is a broken gate, and a
   gate that disappears when its tool does is worse than not having it.
 
+## Pinning the cross-references
+
+The prose gate catches how a sentence is written. It cannot catch a sentence
+that was true when it was written and is now wrong because the thing it
+describes moved. That is [reflock](https://github.com/a-grasso/reflock), and it
+is the second deterministic check on this repo's own docs.
+
+A reference opts in by carrying an empty pin, `<!--@-->` after the link, and
+`reflock stamp` fills it with a fingerprint of the target as it stands. `reflock
+check` recomputes and compares: a target that changed is `DRIFTED`, a target
+that no longer exists is `DANGLING`. Six references in this file are pinned,
+each one a place where the prose makes a claim about a file rather than merely
+linking to it.
+
+```sh
+reflock check                       # what the `refs` gate runs
+reflock explain README.md:271       # why one reference is unhappy
+reflock stamp --rebless --reviewed  # accept a drift, after re-reading the prose
+```
+
+The placement inverts the prose gate, and the inversion is the whole point.
+`prose` is scoped to the files the push carries, because a page you never touch
+is not your problem. `refs` is scoped to the whole tree, because the file that
+went stale is precisely the one the push does not contain: you edited A, and the
+paragraph describing A lives in B. Scoping this to changed files would leave it
+checking everything except the case it exists for.
+
+Accepting a drift takes `--rebless --reviewed`, and `--rebless` alone writes
+nothing. Re-reading the paragraph is the work; the fingerprint is only the
+receipt that you did.
+
 ## The global-hooksPath problem
 
 Git has no hook-chaining and no per-repo layering: a global `core.hooksPath`
@@ -301,7 +332,7 @@ Git has no hook-chaining and no per-repo layering: a global `core.hooksPath`
 every existing hook on the machine.
 
 So `install` does not drop in one `pre-push`. It symlinks
-[hooks/dispatch](hooks/dispatch) as *every* client-side hook name, and the
+[hooks/dispatch](hooks/dispatch)<!--@b9da807d--> as *every* client-side hook name, and the
 dispatcher's second job, before anything else, is to delegate to the repo's
 own `.git/hooks/<name>`, replaying `pre-push`'s stdin so the delegate sees the
 same ref updates. Adding a hook name to the list in `bin/turnstile` is the
