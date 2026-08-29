@@ -19,8 +19,10 @@ no-pyc:    ! { [ -n "${TURNSTILE_RANGE:-}" ] && git diff --name-only --diff-filt
 # failure this repo argues against everywhere else. `--minAlertLevel=error`
 # because a failing check is shown as `tail -n 40`: leave the 40 advisory
 # suggestions in and they push the violation that blocked the push out of the
-# window. Run `vale` by hand to see them.
-prose:     command -v vale >/dev/null || { echo "vale not on PATH - 'nix run nixpkgs#vale -- sync' or install it" >&2; exit 1; }; { [ -n "${TURNSTILE_CHANGED_FILES:-}" ] && printf '%s\n' "$TURNSTILE_CHANGED_FILES" || git diff --cached --name-only; } | grep -E '\.(md|py)$' | grep -v '^eval/fixtures/' | while read -r p; do [ -f "$p" ] && printf '%s\n' "$p"; done | tr '\n' '\0' | xargs -0 vale --minAlertLevel=error
+# window. Run `vale` by hand to see them. `set +o pipefail` because the gate
+# runs checks under it and a `grep` that matches nothing is the ordinary case
+# here, not a failure: the status that means anything is vale's, at the end.
+prose:     set +o pipefail; command -v vale >/dev/null || { echo "vale not on PATH - 'nix run nixpkgs#vale -- sync' or install it" >&2; exit 1; }; { [ -n "${TURNSTILE_CHANGED_FILES:-}" ] && printf '%s\n' "$TURNSTILE_CHANGED_FILES" || git diff --cached --name-only; } | grep -E '\.(md|py)$' | grep -v '^eval/fixtures/' | while read -r p; do [ -f "$p" ] && printf '%s\n' "$p"; done | tr '\n' '\0' | xargs -0 vale --minAlertLevel=error
 
 # Reference drift. Deliberately *not* scoped to the pushed files: the failure
 # reflock exists for is a paragraph in B going stale because A changed, and B is
