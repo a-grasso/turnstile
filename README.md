@@ -29,9 +29,9 @@ Not a skill. Not an agent. A `pre-push` hook that runs the repo's own checks
 and refuses the push if they fail, because the code path was taken, not
 because a model decided the moment was relevant.
 
-**Status: prototype.** Two evenings old, unproven in daily use. The
-deterministic half is solid; the [AI modules](#ai-modules) are new and have no
-eval behind them yet.
+**Status: prototype.** Unproven in daily use. The deterministic half is solid
+and has a test suite. Of the [AI modules](#ai-modules), only `secrets` has an
+[eval corpus](#measuring-a-module) behind it.
 
 ## Why
 
@@ -42,14 +42,16 @@ most and the moment it is least likely to be invoked.
 
 A hook has no judgment. It is on the road out or it isn't.
 
-Two enforcement points, covering different traffic:
+Three enforcement points, covering different traffic:
 
 | | catches | can be bypassed by |
 |---|---|---|
 | `pre-push` hook | you, agents, the IDE, anything calling git | a human typing `--no-verify` |
 | `PreToolUse` hook | Claude Code's Bash tool | you, by editing settings.json |
+| `Stop` hook | a Claude Code agent ending its turn on a red tree | you, by editing settings.json |
 
-The pair matters. `--no-verify` is the right escape hatch for a person: they
+The `Stop` hook is the early one; see [the agent's loop](#the-agents-loop). The
+first two are a pair. `--no-verify` is the right escape hatch for a person: they
 have decided to take responsibility. It is the wrong one for an agent, which
 has decided nothing and is routing around a failing check because that makes
 the task look finished. So the second hook closes it, for the agent only.
@@ -83,17 +85,22 @@ Then, per repo you want gated, a `.turnstile` file in the root:
 
 ```
 lint: make lint
-test: go test ./...
+cli [cli/** go.work]: make -C cli test
 
 ai review:  block=high
 ai secrets: block=medium
 ```
 
-Repos without one pass straight through. See [examples/.turnstile](examples/.turnstile)<!--@13caced8-->.
+Repos without one pass straight through. A check with a bracketed scope runs
+only when the change touches a file its globs match; see
+[scoped checks](#scoped-checks-and-the-pass-cache). See [examples/.turnstile](examples/.turnstile)<!--@13caced8-->.
 
 For the agent-side half, point a Claude Code `PreToolUse` hook at
-[claude/no-bypass.py](claude/no-bypass.py)<!--@360addfc-->. The docstring has the
-settings.json block.
+[claude/no-bypass.py](claude/no-bypass.py)<!--@360addfc--> and a `Stop` hook at
+[claude/verify-on-stop.py](claude/verify-on-stop.py)<!--@8c48e426-->. Each docstring has its
+settings.json block. Put them in your user settings rather than a repo's: both
+do nothing in a repo without a `.turnstile`, so a teammate who has not
+installed turnstile is never affected.
 
 Undo everything with `turnstile uninstall`.
 
@@ -103,10 +110,68 @@ Undo everything with `turnstile uninstall`.
 turnstile install      install the global hook dispatcher
 turnstile uninstall    remove it
 turnstile status       show gate state + this repo's checks
-turnstile run          run this repo's checks now, without pushing
+turnstile run          run this repo's checks on the working tree, without pushing
+  --no-ai              skip the ai modules (they run once, at push)
+  --no-cache           rerun checks that already passed on this tree
 turnstile ai [args]    run only the ai modules
 turnstile doctor       diagnose the installation
 ```
+
+## Scoped checks and the pass cache
+
+A repo with several modules rarely wants every check on every change, and an
+agent that already ran the tests should not wait for them again at push. Two
+mechanisms handle that, and neither makes turnstile a task runner. `.turnstile`
+says *what* gates and *when*; the commands it names (`make`, `just`, a script)
+keep saying *how*.
+
+**Scope.** `name [glob ...]: command` runs only when the change touches a file
+one of the globs matches. Globs are git pathspec globs: `**` crosses
+directories, `*` does not. A scoped check that is skipped prints as
+`· name (not touched)`, so a quiet gate never reads as a thorough one.
+
+**Pass cache.** A check that passes is recorded against what it could see:
+the files in its scope (the whole tree when unscoped), the command, and the
+base of the change. The same check on the same content is then
+`✓ name (cached)` and costs nothing. An edit outside a check's scope keeps its
+pass. A failure is never cached. Entries live under `~/.turnstile/cache/checks/`
+and expire after 30 days; `--no-cache` ignores them.
+
+The tree is read as it stands, uncommitted and untracked files included,
+through a scratch index that never touches yours. That is what lets a pass from
+`turnstile run` on uncommitted work be a cache hit at push, once that work is
+committed unchanged.
+
+**A check that rewrites files fails.** A formatter in fix mode passes against
+files that no longer exist, so turnstile compares the tree before and after
+each check and refuses a pass that changed it, listing the files. Commit what
+is right and run again; the second run passes.
+
+Checks get `TURNSTILE_RANGE`, `TURNSTILE_BASE`, `TURNSTILE_CHANGED_FILES` and
+`TURNSTILE_DIFF_FILE` (the change as a patch) so they can scope themselves
+further.
+
+## The agent's loop
+
+```
+agent writes code
+  → runs a single test, as often as it likes        (its own business)
+  → ends its turn  → Stop hook: turnstile run --no-ai (cached, refuses red)
+  → pushes         → pre-push: cached checks + ai modules, once
+```
+
+The pre-push gate alone catches a failing check after the session that caused
+it has moved on. [claude/verify-on-stop.py](claude/verify-on-stop.py)<!--@8c48e426--> runs the
+deterministic checks whenever the agent ends a turn and, on failure, blocks the
+stop with the report, so the agent fixes it while it still has the context.
+Nothing depends on the agent remembering to verify, which is the argument
+against skills this tool started from.
+
+The loop is bounded. When the checks still fail and the tree has not changed
+since the last refusal, the agent is let go and the failure is left for you.
+The ai modules never run here: they cost money per call and run once, at push.
+Because passes are cached per tree, a turn that changed nothing costs nothing,
+and the push after a green turn mostly reads the cache.
 
 ## AI modules
 
@@ -123,8 +188,30 @@ ai review:  block=never        # report findings, never refuse
 `block` names the lowest severity that refuses a push. Findings below it still
 print, marked `advisory`. Severities are `low`, `medium`, `high`, `critical`.
 
-Two built-ins ship: **`review`** (correctness defects provable from the diff)
-and **`secrets`** (credentials and private data about to be published).
+Four built-ins ship:
+
+| module | finds | default block |
+|---|---|---|
+| `review` | correctness defects provable from the diff | `high` |
+| `secrets` | credentials and private data about to be published | `medium` |
+| `docs` | docs the change makes false, and doc obligations it skipped | `medium` |
+| `tests` | tests weakened, bent or removed to make a change pass | `high` |
+
+`docs` is the one built-in with tools (`Read`, `Grep`, `Glob`): the doc that
+went stale is usually a file the diff does not touch.
+
+### Intent
+
+```
+intent: git log --format=%B "$TURNSTILE_RANGE" | grep -oE '#[0-9]+' | sort -u | tr -d '#' | xargs -n1 gh issue view
+```
+
+An `intent:` line names a command whose output tells the modules what the
+change is for, usually the linked issue. It runs once per review with
+`TURNSTILE_RANGE` set, and its output reaches every module inside an
+`<intent>` block. A reviewer that knows the intent stops flagging deliberate
+decisions, and `docs` can hold the change against the issue's acceptance
+criteria. A failing or slow intent command costs the context, not the push.
 
 ### Writing one
 
@@ -177,6 +264,12 @@ source, and the model**. So:
 - Re-pushing the same commits is free and instant (~0.1s vs ~30s).
 - Editing a module's prompt invalidates its cache, because tuning a prompt and
   silently replaying the old answer reads as the edit having done nothing.
+
+A module that passed a change is not asked about it twice. When `tests`
+refuses a push and the fix is pushed, `docs` reviews only the follow-up since
+its pass, and says so as `follow-up since abc1234`. A module that refused
+reviews the whole change again, because it has to see whether its finding is
+gone.
 
 ### Failure is open, on purpose
 
@@ -443,9 +536,9 @@ configuration language.
 
 **Checks run in-tree, not in a worktree.** They see your working directory as
 it is. That is wrong for validation of a *pushed* range and right for a
-prototype that has to stay fast; `TURNSTILE_RANGE` and
-`TURNSTILE_CHANGED_FILES` are exported so a check can scope itself. Worktree
-isolation belongs with the review stage, where it actually buys something.
+prototype that has to stay fast. The pass cache is keyed on that same working
+tree, so it never claims more than the checks saw. Worktree isolation belongs
+with the review stage, where it actually buys something.
 
 **Every pushed ref is gated, in its own pass.** An earlier cut checked only the
 first content-bearing ref and warned about the rest, which was the wrong
@@ -454,21 +547,22 @@ worse than no gate. Multi-ref pushes are rare enough that repeating the
 deterministic checks costs nothing in practice, and the AI cache means an
 identical diff across two refs is not paid for twice.
 
-**Unsolved: the intent channel.** The `PreToolUse` hook fires inside a session
-that *does* know why a change was made, and could hand that to the review
-stage. The probe above is the reason that is not urgent any more, not a reason
-it is worthless. The case it would help is precisely the one the probe could
-not construct, a deliberate decision that reads as a defect.
+**Partly solved: the intent channel.** The [`intent:` line](#intent) carries
+what the tracker knows. What it does not carry is the session: the agent knows
+why it made each change, and nothing hands that to the review stage yet. The
+case it would help is precisely the one the probe could not construct, a
+deliberate decision that reads as a defect.
 
-**Unsolved: no eval.** Module prompts are tuned by reading their output on a
-handful of diffs. The one prompt fix so far *was* checked against the three
+**Unsolved: an eval for three of four modules.** `secrets` has a corpus. The
+`review`, `docs` and `tests` prompts are tuned by reading their output on a
+handful of diffs. The one `review` fix so far *was* checked against the three
 commits it had to keep getting right, but that is a regression test with n=3,
 run by hand, not an eval. A change that trades a true positive for a false
 negative on code nobody re-ran is still invisible.
 
-That is the honest ceiling on everything above. Until there is a corpus of
-diffs with known defects, every claim here is "it looked right on the diffs we
-tried", and prompt tuning stays a matter of taste. It is also the single most
+That is the honest ceiling on everything above. Until those modules have a
+corpus of diffs with known defects, every claim about them is "it looked right
+on the diffs we tried", and prompt tuning stays a matter of taste. It is also the single most
 expensive thing left to build, which is why the recommendation is to run the
 cheap module everywhere and the expensive one advisory-only until it has
 earned more than n=8.
