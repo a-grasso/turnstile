@@ -205,6 +205,31 @@ class HookEnvironment(unittest.TestCase):
             self.assertEqual(fh.read(), "unset")
 
 
+class NewBranchBase(unittest.TestCase):
+    def test_new_branch_is_diffed_against_the_remote_branch_it_was_cut_from(self):
+        r = Repo(self)
+        seen = os.path.join(r.tmp, "seen")
+        r.config(f'probe: printf "%s" "$TURNSTILE_CHANGED_FILES" > {seen}\n')
+        r.commit_all("config")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "-c", "develop")
+        r.write("unreleased.txt", "on develop, not on main\n")
+        r.commit_all("develop work")
+        r.git("push", "-q", "-u", "origin", "develop", "--no-verify")
+        r.git("switch", "-q", "-c", "feature")
+        r.write("feature.txt", "the change being pushed\n")
+        r.commit_all("feature")
+
+        head = r.git("rev-parse", "HEAD").strip()
+        zero = "0" * 40
+        res = r.turnstile("__pre-push", "origin",
+                          stdin=f"refs/heads/feature {head} refs/heads/feature {zero}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(seen) as fh:
+            self.assertEqual(fh.read().split(), ["feature.txt"])
+
+
 class PassCache(unittest.TestCase):
     def test_a_pass_on_an_unchanged_tree_is_not_rerun(self):
         r = Repo(self)

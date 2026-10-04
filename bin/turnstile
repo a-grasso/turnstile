@@ -171,8 +171,7 @@ compute_ranges() {
 
     local range
     if [ "$remote_sha" = "$ZERO" ] || [ -z "$remote_sha" ]; then
-      # New remote branch: diff against the default branch when we can find
-      # it, otherwise fall back to the last commit rather than the repo root.
+      # New remote branch: diff against the remote branch it was cut from.
       local base; base="$(default_base "$local_sha")"
       range="${base}..${local_sha}"
     else
@@ -185,17 +184,28 @@ compute_ranges() {
 }
 
 default_base() {
-  local head="$1" b sha head_sha
-  head_sha="$(git rev-parse --verify --quiet "$head" 2>/dev/null)"
-  for b in origin/HEAD origin/main origin/master main master; do
-    sha="$(git rev-parse --verify --quiet "$b" 2>/dev/null)" || continue
-    # Must be a *strict* ancestor. A base that resolves to HEAD itself (pushing
-    # `main` for the first time, say) yields an empty range and a gate that
-    # silently checks nothing.
-    [ "$sha" = "$head_sha" ] && continue
-    git merge-base --is-ancestor "$b" "$head" 2>/dev/null || continue
-    printf '%s' "$b"; return 0
-  done
+  local head="$1" b mb ahead best="" best_ahead=""
+  # The remote branch the change was cut from, not always the default one: a
+  # branch off `develop` diffed against `main` drags every unreleased commit
+  # into the review. Nearest wins, measured as commits between fork point and
+  # head; ties go to the earlier candidate, so origin/HEAD first.
+  while IFS= read -r b; do
+    mb="$(git merge-base "$b" "$head" 2>/dev/null)" || continue
+    ahead="$(git rev-list --count "$mb..$head" 2>/dev/null)" || continue
+    # Zero means head is already on that branch: an empty range and a gate
+    # that silently checks nothing.
+    [ "$ahead" -gt 0 ] || continue
+    if [ -z "$best" ] || [ "$ahead" -lt "$best_ahead" ]; then
+      best="$mb"; best_ahead="$ahead"
+    fi
+  done < <(
+    for b in origin/HEAD origin/main origin/master; do
+      git rev-parse --verify --quiet "$b" >/dev/null 2>&1 && printf '%s\n' "$b"
+    done
+    git for-each-ref --format='%(refname:short)' refs/remotes | grep -v '/HEAD$'
+    printf '%s\n' main master
+  )
+  if [ -n "$best" ]; then printf '%s' "$best"; return 0; fi
   # Nothing usable: diff against git's empty tree so a first push is checked in
   # full. Using the root commit instead would silently drop every file the root
   # commit introduced.
