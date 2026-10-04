@@ -229,6 +229,32 @@ class NewBranchBase(unittest.TestCase):
         with open(seen) as fh:
             self.assertEqual(fh.read().split(), ["feature.txt"])
 
+    def test_rebased_branch_is_diffed_against_its_new_base_not_its_old_tip(self):
+        r = Repo(self)
+        seen = os.path.join(r.tmp, "seen")
+        r.config(f'probe: printf "%s" "$TURNSTILE_CHANGED_FILES" > {seen}\n')
+        r.commit_all("config")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "-c", "feature")
+        r.write("feature.txt", "the change being pushed\n")
+        r.commit_all("feature")
+        r.git("push", "-q", "-u", "origin", "feature", "--no-verify")
+        old_tip = r.git("rev-parse", "HEAD").strip()
+        r.git("switch", "-q", "main")
+        r.write("upstream.txt", "landed on main meanwhile\n")
+        r.commit_all("upstream work")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "feature")
+        r.git("rebase", "-q", "main")
+
+        head = r.git("rev-parse", "HEAD").strip()
+        res = r.turnstile("__pre-push", "origin",
+                          stdin=f"refs/heads/feature {head} refs/heads/feature {old_tip}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(seen) as fh:
+            self.assertEqual(fh.read().split(), ["feature.txt"])
+
 
 class PassCache(unittest.TestCase):
     def test_a_pass_on_an_unchanged_tree_is_not_rerun(self):
@@ -419,6 +445,22 @@ class DeltaReview(unittest.TestCase):
         tests = self.prompt_for("BLOCKME")
         self.assertIn("FIRST-CHANGE", tests)
         self.assertIn("SECOND-CHANGE", tests)
+
+    def test_a_pass_on_a_sibling_branch_is_not_a_pass_on_this_one(self):
+        r = self.r
+        self.assertEqual(self.review().returncode, 0)
+
+        r.git("switch", "-q", "-c", "sibling", "origin/main")
+        r.git("checkout", "main", "--", ".turnstile", ".turnstile.d")
+        r.write("lib/b.txt", "SIBLING-CHANGE\n")
+        r.commit_all("sibling")
+        res = self.review()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("follow-up", res.stderr + res.stdout)
+        docs = self.prompt_for("Docs reviewer")
+        self.assertIn("SIBLING-CHANGE", docs)
+        self.assertNotIn("FIRST-CHANGE", docs)
 
     def test_an_unchanged_rerun_costs_no_model_call(self):
         self.review()

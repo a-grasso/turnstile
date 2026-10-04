@@ -170,8 +170,10 @@ compute_ranges() {
     [ "$local_sha" = "$ZERO" ] && continue
 
     local range
-    if [ "$remote_sha" = "$ZERO" ] || [ -z "$remote_sha" ]; then
-      # New remote branch: diff against the remote branch it was cut from.
+    # A new remote branch, or a rewritten one (rebase, amend): the old tip is
+    # not where this change starts, so diff against the branch it was cut from.
+    if [ "$remote_sha" = "$ZERO" ] || [ -z "$remote_sha" ] \
+      || ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
       local base; base="$(default_base "$local_sha")"
       range="${base}..${local_sha}"
     else
