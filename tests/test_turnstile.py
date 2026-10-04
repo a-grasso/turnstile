@@ -354,6 +354,69 @@ class TreeMutation(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
 
 
+class Parallel(unittest.TestCase):
+    def test_checks_run_concurrently(self):
+        r = Repo(self)
+        a, b = os.path.join(r.tmp, "a-started"), os.path.join(r.tmp, "b-started")
+        wait_for = "for i in $(seq 50); do [ -f {} ] && exit 0; sleep 0.1; done; exit 1"
+        r.config(f"a: touch {a}; {wait_for.format(b)}\n"
+                 f"b: touch {b}; {wait_for.format(a)}\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_results_are_reported_in_config_order(self):
+        r = Repo(self)
+        r.config("slow: sleep 1\nfast: true\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertLess(res.stderr.index("slow"), res.stderr.index("fast"))
+
+
+class PushOnly(unittest.TestCase):
+    def test_stop_mode_skips_a_push_only_check_and_says_so(self):
+        r = Repo(self)
+        r.config(f"push e2e: {r.counted()}\n")
+
+        res = r.turnstile("run", "--stop")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 0)
+        self.assertIn("e2e (at push)", res.stderr)
+
+    def test_a_full_run_includes_push_only_checks(self):
+        r = Repo(self)
+        r.config(f"push e2e: {r.counted()}\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 1)
+
+    def test_push_only_check_keeps_its_scope(self):
+        r = Repo(self)
+        r.config(f"push e2e [lib/**]: {r.counted()}\n")
+        r.write("a.txt", "changed\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(r.runs(), 0)
+        self.assertIn("e2e (not touched)", res.stderr)
+
+    def test_stop_mode_never_calls_the_model(self):
+        r = Repo(self)
+        r.write(".turnstile.d/modules/m.md", "---\nname: m\n---\nReview it.\n")
+        r.config("unit: true\nai m: block=high\n")
+        r.write("a.txt", "x\n")
+        r.commit_all()
+
+        r.turnstile("run", "--stop")
+
+        self.assertEqual(r.prompts(), [])
+
+
 class Intent(unittest.TestCase):
     def test_intent_line_is_not_executed_as_a_check(self):
         r = Repo(self)
@@ -523,6 +586,14 @@ class StopHook(unittest.TestCase):
         res = self.stop(r, active=True)
 
         self.assertEqual(json.loads(res.stdout)["decision"], "block")
+
+    def test_a_failing_push_only_check_does_not_block_the_stop(self):
+        r = Repo(self)
+        r.config("unit: true\npush e2e: false\n")
+
+        res = self.stop(r)
+
+        self.assertEqual(res.stdout.strip(), "")
 
     def test_ai_modules_do_not_run_on_stop(self):
         r = Repo(self)

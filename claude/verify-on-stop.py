@@ -51,7 +51,7 @@ REASON = """turnstile: this repo's checks fail on the working tree, so the work 
 
 Fix what they report, then end your turn again; the checks rerun automatically,
 and the ones that already passed on this tree are not rerun. `turnstile run
---no-ai` shows the same report. If a check itself is wrong, say so to the user
+--stop` shows the same report. If a check itself is wrong, say so to the user
 instead of working around it."""
 
 
@@ -79,7 +79,7 @@ def main() -> int:
         return 0
 
     env = {**os.environ, "NO_COLOR": "1"}
-    run = subprocess.run([TURNSTILE, "run", "--no-ai"], cwd=root, env=env,
+    run = subprocess.run([TURNSTILE, "run", "--stop"], cwd=root, env=env,
                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
     state = state_path(str(payload.get("session_id") or ""))
 

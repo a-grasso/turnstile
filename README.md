@@ -86,6 +86,7 @@ Then, per repo you want gated, a `.turnstile` file in the root:
 ```
 lint: make lint
 cli [cli/** go.work]: make -C cli test
+push e2e [web/**]: make e2e
 
 ai review:  block=high
 ai secrets: block=medium
@@ -97,7 +98,7 @@ only when the change touches a file its globs match; see
 
 For the agent-side half, point a Claude Code `PreToolUse` hook at
 [claude/no-bypass.py](claude/no-bypass.py)<!--@360addfc--> and a `Stop` hook at
-[claude/verify-on-stop.py](claude/verify-on-stop.py)<!--@8c48e426-->. Each docstring has its
+[claude/verify-on-stop.py](claude/verify-on-stop.py)<!--@c9bb5cd3-->. Each docstring has its
 settings.json block. Put them in your user settings rather than a repo's: both
 do nothing in a repo without a `.turnstile`, so a teammate who has not
 installed turnstile is never affected.
@@ -113,6 +114,7 @@ turnstile status       show gate state + this repo's checks
 turnstile run          run this repo's checks on the working tree, without pushing
   --no-ai              skip the ai modules (they run once, at push)
   --no-cache           rerun checks that already passed on this tree
+  --stop               what an agent's turn end runs: no ai, no push-only checks
 turnstile ai [args]    run only the ai modules
 turnstile doctor       diagnose the installation
 ```
@@ -130,6 +132,15 @@ one of the globs matches. Globs are git pathspec globs: `**` crosses
 directories, `*` does not. A scoped check that is skipped prints as
 `· name (not touched)`, so a quiet gate never reads as a thorough one.
 
+**Push-only.** `push name [glob ...]: command` is a check too slow for every
+agent turn: an e2e suite, a full frontend build. The Stop hook skips it and
+prints `· name (at push)`; pre-push, CI and a plain `turnstile run` still run
+it. The budget for what stays is about ten seconds warm, because the agent
+waits for it on every turn.
+
+**Parallel.** Checks that have to run start together, so the gate costs the
+slowest check rather than the sum. Results print in config order.
+
 **Pass cache.** A check that passes is recorded against what it could see:
 the files in its scope (the whole tree when unscoped), the command, and the
 base of the change. The same check on the same content is then
@@ -144,7 +155,8 @@ committed unchanged.
 
 **A check that rewrites files fails.** A formatter in fix mode passes against
 files that no longer exist, so turnstile compares the tree before and after
-each check and refuses a pass that changed it, listing the files. Commit what
+the checks and refuses a run that changed it, listing the files. Checks run
+concurrently, so the report names the batch rather than one check. Commit what
 is right and run again; the second run passes.
 
 Checks get `TURNSTILE_RANGE`, `TURNSTILE_BASE`, `TURNSTILE_CHANGED_FILES` and
@@ -156,13 +168,13 @@ further.
 ```
 agent writes code
   → runs a single test, as often as it likes        (its own business)
-  → ends its turn  → Stop hook: turnstile run --no-ai (cached, refuses red)
+  → ends its turn  → Stop hook: turnstile run --stop (cached, refuses red)
   → pushes         → pre-push: cached checks + ai modules, once
 ```
 
 The pre-push gate alone catches a failing check after the session that caused
-it has moved on. [claude/verify-on-stop.py](claude/verify-on-stop.py)<!--@8c48e426--> runs the
-deterministic checks whenever the agent ends a turn and, on failure, blocks the
+it has moved on. [claude/verify-on-stop.py](claude/verify-on-stop.py)<!--@c9bb5cd3--> runs the
+deterministic checks that are not push-only whenever the agent ends a turn and, on failure, blocks the
 stop with the report, so the agent fixes it while it still has the context.
 Nothing depends on the agent remembering to verify, which is the argument
 against skills this tool started from.
