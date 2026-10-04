@@ -50,8 +50,13 @@ class Repo:
         with open(gitconfig, "w") as fh:
             fh.write("[user]\n\tname = t\n\temail = turnstile-test\n[init]\n\tdefaultBranch = main\n")
 
+        # Under a git hook (this suite runs in turnstile's own pre-push gate)
+        # GIT_DIR and friends point at the real repo, and every git call below
+        # would land there.
+        inherited = {k: v for k, v in os.environ.items()
+                     if not k.startswith(("GIT_", "TURNSTILE_"))}
         self.env = {
-            **os.environ,
+            **inherited,
             "PATH": f"{fakebin}:{os.environ['PATH']}",
             "GIT_CONFIG_GLOBAL": gitconfig,
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -62,8 +67,6 @@ class Repo:
             "FAKE_CLAUDE_BLOCK_FLAG": self.block_flag,
             "NO_COLOR": "1",
         }
-        for var in ("TURNSTILE_SKIP", "TURNSTILE_RANGE", "TURNSTILE_CHANGED_FILES"):
-            self.env.pop(var, None)
 
         subprocess.run(["git", "init", "-q", "--bare", self.remote], env=self.env, check=True)
         subprocess.run(["git", "init", "-q", self.root], env=self.env, check=True)
@@ -179,6 +182,27 @@ class ScopedChecks(unittest.TestCase):
 
         self.assertEqual(clean.returncode, 0, clean.stderr)
         self.assertEqual(dirty.returncode, 1, dirty.stderr)
+
+
+class HookEnvironment(unittest.TestCase):
+    def test_checks_do_not_see_the_hooks_git_environment(self):
+        r = Repo(self)
+        decoy = os.path.join(r.tmp, "decoy.git")
+        subprocess.run(["git", "init", "-q", "--bare", decoy], env=r.env, check=True)
+        seen = os.path.join(r.tmp, "seen")
+        r.config(f'probe: printf "%s" "${{GIT_DIR:-unset}}" > {seen}\n')
+        r.commit_all("config")
+
+        head = r.git("rev-parse", "HEAD").strip()
+        remote = r.git("rev-parse", "origin/main").strip()
+        env = {**r.env, "GIT_DIR": os.path.join(r.root, ".git"), "GIT_INDEX_FILE": os.path.join(r.root, ".git", "index")}
+        res = subprocess.run([TURNSTILE, "__pre-push", "origin"], cwd=r.root, env=env,
+                             input=f"refs/heads/main {head} refs/heads/main {remote}\n",
+                             capture_output=True, text=True)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(seen) as fh:
+            self.assertEqual(fh.read(), "unset")
 
 
 class PassCache(unittest.TestCase):

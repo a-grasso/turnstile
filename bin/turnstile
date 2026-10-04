@@ -334,7 +334,8 @@ run_checks() {
     fi
   fi
 
-  local tree_before tree_after rewritten key fresh g
+  local tree_before tree_after rewritten key fresh g git_local_env
+  git_local_env="$(git rev-parse --local-env-vars)"
   tree_before="$(cd "$root" && snapshot_tree)"
 
   for i in "${!names[@]}"; do
@@ -359,8 +360,11 @@ run_checks() {
     start=$SECONDS
     [ -n "$CLEAR_LINE" ] && printf '  %s… %s%s' "$C_DIM" "$name" "$C_RESET" >&2
     # Checks must not inherit the hook's stdin (the ref list); one `read` in a
-    # check script would otherwise hang the push.
-    ( cd "$root" && eval "$cmd" ) >"$out" 2>&1 </dev/null
+    # check script would otherwise hang the push. Nor git's hook environment:
+    # with GIT_DIR exported, a test suite that builds a temp repo commits into
+    # this one instead.
+    # shellcheck disable=SC2086
+    ( cd "$root" && unset $git_local_env && eval "$cmd" ) >"$out" 2>&1 </dev/null
     rc=$?
     elapsed=$((SECONDS - start))
 
