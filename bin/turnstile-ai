@@ -202,6 +202,9 @@ def delta_diff(since: str, head: str, root: str) -> str | None:
     """The change from an earlier passing head to this one, if git still has it."""
     try:
         git("cat-file", "-e", f"{since}^{{commit}}", cwd=root)
+        # Passes are recorded per base, so a sibling branch cut from the same
+        # base leaves one here too; diffing against it reviews neither branch.
+        git("merge-base", "--is-ancestor", since, head, cwd=root)
     except TurnstileError:
         return None
     return git("diff", since, head, "-U8", "--no-color", cwd=root)
