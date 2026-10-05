@@ -39,12 +39,9 @@ class Repo:
         self.claude_log = os.path.join(self.tmp, "claude-log")
         self.block_flag = os.path.join(self.tmp, "block-flag")
 
-        fakebin = os.path.join(self.tmp, "bin")
+        self.fakebin = fakebin = os.path.join(self.tmp, "bin")
         os.makedirs(fakebin)
-        claude = os.path.join(fakebin, "claude")
-        with open(claude, "w") as fh:
-            fh.write(FAKE_CLAUDE)
-        os.chmod(claude, 0o755)
+        self.fake("claude", FAKE_CLAUDE)
 
         gitconfig = os.path.join(self.tmp, "gitconfig")
         with open(gitconfig, "w") as fh:
@@ -54,7 +51,8 @@ class Repo:
         # GIT_DIR and friends point at the real repo, and every git call below
         # would land there.
         inherited = {k: v for k, v in os.environ.items()
-                     if not k.startswith(("GIT_", "TURNSTILE_"))}
+                     if not k.startswith(("GIT_", "TURNSTILE_"))
+                     and k not in ("IN_NIX_SHELL", "DIRENV_DIR")}
         self.env = {
             **inherited,
             "PATH": f"{fakebin}:{os.environ['PATH']}",
@@ -76,6 +74,12 @@ class Repo:
         self.git("commit", "-qm", "init")
         self.git("remote", "add", "origin", self.remote)
         self.git("push", "-q", "-u", "origin", "main", "--no-verify")
+
+    def fake(self, name: str, script: str) -> None:
+        path = os.path.join(self.fakebin, name)
+        with open(path, "w") as fh:
+            fh.write(script)
+        os.chmod(path, 0o755)
 
     def write(self, rel: str, content: str) -> None:
         path = os.path.join(self.root, rel)
@@ -621,6 +625,145 @@ class StopHook(unittest.TestCase):
         res = r.turnstile("hook", "nope")
 
         self.assertNotEqual(res.returncode, 0)
+
+
+FAKE_NIX = """#!/bin/sh
+echo "$*" >> "$NIX_LOG"
+[ -z "${NIX_FAILS:-}" ] || { echo "error: flake has no devShell" >&2; exit 1; }
+[ "$1" = print-dev-env ] || exit 1
+echo 'export DEVENV_TOOL=from-devenv'
+[ -z "${FAKE_BASH:-}" ] || echo "BASH='$FAKE_BASH'"
+"""
+
+
+class StopInDevEnvironment(unittest.TestCase):
+    def setUp(self):
+        r = self.r = Repo(self)
+        self.nix_log = os.path.join(r.tmp, "nix-log")
+        self.seen = os.path.join(r.tmp, "seen")
+        r.fake("nix", FAKE_NIX)
+        os.symlink(TURNSTILE, os.path.join(r.fakebin, "turnstile"))
+        r.write("flake.nix", "{}\n")
+        r.write("flake.lock", "{}\n")
+        r.config(f'probe: printf "%s" "${{DEVENV_TOOL:-bare}}" > {self.seen}\n')
+        r.commit_all("flake")
+        self.env = {**r.env, "NIX_LOG": self.nix_log, "CLAUDE_PROJECT_DIR": r.root}
+
+    def stop(self, **extra: str) -> subprocess.CompletedProcess:
+        with open(SETTINGS) as fh:
+            command = json.load(fh)["hooks"]["Stop"][0]["hooks"][0]["command"]
+        payload = {"session_id": "s1", "cwd": self.r.root, "hook_event_name": "Stop"}
+        return subprocess.run(["/bin/sh", "-c", command], input=json.dumps(payload),
+                              env={**self.env, **extra}, capture_output=True, text=True,
+                              cwd=self.r.tmp)
+
+    def nix_calls(self) -> list[str]:
+        try:
+            with open(self.nix_log) as fh:
+                return fh.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def probed(self) -> str:
+        with open(self.seen) as fh:
+            return fh.read()
+
+    def test_checks_run_inside_the_projects_dev_environment(self):
+        res = self.stop()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.probed(), "from-devenv")
+        self.assertEqual(len(self.nix_calls()), 1)
+        self.assertTrue(self.nix_calls()[0].startswith("print-dev-env"))
+
+    def test_the_dev_environment_is_cached_under_the_git_dir(self):
+        self.stop()
+
+        cached = os.listdir(os.path.join(self.r.root, ".git", "turnstile"))
+        self.assertEqual(len(cached), 1, cached)
+
+    def test_a_second_stop_does_not_ask_nix_again(self):
+        self.stop()
+        self.r.write("a.txt", "edited\n")
+
+        res = self.stop()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(len(self.nix_calls()), 1)
+        self.assertEqual(self.probed(), "from-devenv")
+
+    def test_editing_flake_lock_rebuilds_the_dev_environment(self):
+        self.stop()
+        self.r.write("flake.lock", '{"version": 7}\n')
+
+        self.stop()
+
+        self.assertEqual(len(self.nix_calls()), 2)
+        self.assertEqual(len(os.listdir(os.path.join(self.r.root, ".git", "turnstile"))), 1)
+
+    def test_already_inside_a_nix_shell_nix_is_not_asked(self):
+        res = self.stop(IN_NIX_SHELL="impure")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.nix_calls(), [])
+        self.assertEqual(self.probed(), "bare")
+
+    def test_already_inside_direnv_nix_is_not_asked(self):
+        self.stop(DIRENV_DIR="-/some/project")
+
+        self.assertEqual(self.nix_calls(), [])
+        self.assertEqual(self.probed(), "bare")
+
+    def test_a_project_without_a_flake_runs_bare(self):
+        self.r.git("rm", "-q", "flake.nix", "flake.lock")
+        self.r.commit_all("no flake")
+
+        self.stop()
+
+        self.assertEqual(self.nix_calls(), [])
+        self.assertEqual(self.probed(), "bare")
+
+    def test_a_repo_without_turnstile_config_never_builds_an_environment(self):
+        self.r.git("rm", "-q", ".turnstile")
+        self.r.commit_all("ungated")
+
+        res = self.stop()
+
+        self.assertEqual(self.nix_calls(), [])
+        self.assertEqual(res.stdout.strip(), "")
+
+    def test_without_nix_the_checks_run_bare(self):
+        os.unlink(os.path.join(self.r.fakebin, "nix"))
+
+        res = self.stop()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.probed(), "bare")
+
+    def test_a_failed_environment_build_is_reported_and_the_checks_still_run(self):
+        res = self.stop(NIX_FAILS="1")
+
+        message = json.loads(res.stdout)["systemMessage"]
+        self.assertIn("could not build the dev environment", message)
+        self.assertIn("flake has no devShell", message)
+        self.assertEqual(self.probed(), "bare")
+        self.assertEqual(os.listdir(os.path.join(self.r.root, ".git", "turnstile")), [])
+
+    def test_the_profile_is_sourced_with_the_bash_it_names(self):
+        bash_log = os.path.join(self.r.tmp, "bash-log")
+        self.r.fake("devenv-bash", f'#!/bin/sh\necho used >> {bash_log}\nexec /bin/bash "$@"\n')
+
+        self.stop(FAKE_BASH=os.path.join(self.r.fakebin, "devenv-bash"))
+
+        self.assertTrue(os.path.exists(bash_log))
+        self.assertEqual(self.probed(), "from-devenv")
+
+    def test_a_red_check_still_blocks_with_the_payload_read_through_the_environment(self):
+        self.r.config("unit: false\n")
+
+        res = self.stop()
+
+        self.assertEqual(json.loads(res.stdout)["decision"], "block")
 
 
 class ClaudeSettingsBlock(unittest.TestCase):

@@ -594,8 +594,7 @@ cmd_tree() {
 cmd_hook() {
   case "${1:-}" in
     claude-stop)
-      command -v python3 >/dev/null 2>&1 || die "python3 not on PATH - the claude-stop hook cannot run"
-      exec python3 "$TURNSTILE_HOME/claude/stop-hook.py"
+      exec sh "$TURNSTILE_HOME/claude/stop-hook.sh"
       ;;
     *) die "unknown hook: ${1:-}  (known: claude-stop)" ;;
   esac

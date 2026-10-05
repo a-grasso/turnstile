@@ -29,6 +29,14 @@ and the ones that already passed on this tree are not rerun. `turnstile run
 instead of working around it."""
 
 
+def emit(decision: dict) -> None:
+    notice = os.environ.get("TURNSTILE_NOTICE")
+    if notice:
+        decision["systemMessage"] = "\n".join(filter(None, [notice, decision.get("systemMessage")]))
+    if decision:
+        print(json.dumps(decision))
+
+
 def git(*args: str, cwd: str) -> str | None:
     proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
                           stdin=subprocess.DEVNULL)
@@ -62,6 +70,7 @@ def main() -> int:
             os.unlink(state)
         except OSError:
             pass
+        emit({})
         return 0
 
     tree = subprocess.run([TURNSTILE, "__tree"], cwd=root, env=env, capture_output=True,
@@ -73,10 +82,8 @@ def main() -> int:
         last_refused = ""
 
     if payload.get("stop_hook_active") and tree and tree == last_refused:
-        print(json.dumps({
-            "systemMessage": "turnstile: checks still fail and nothing changed since the "
-                             "last attempt, so the agent stopped. Run `turnstile run`."
-        }))
+        emit({"systemMessage": "turnstile: checks still fail and nothing changed since the "
+                               "last attempt, so the agent stopped. Run `turnstile run`."})
         return 0
 
     with open(state, "w", encoding="utf-8") as fh:
@@ -85,7 +92,7 @@ def main() -> int:
     report = (run.stderr + run.stdout).strip()
     if len(report) > MAX_REASON_CHARS:
         report = "...\n" + report[-MAX_REASON_CHARS:]
-    print(json.dumps({"decision": "block", "reason": REASON.format(report=report)}))
+    emit({"decision": "block", "reason": REASON.format(report=report)})
     return 0
 
 

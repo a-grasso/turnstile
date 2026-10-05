@@ -113,11 +113,21 @@ For the agent-side half, commit a Claude Code `Stop` hook to the project's
 
 The command runs in the project directory and picks the first of three:
 
-1. `turnstile hook claude-stop`, when `turnstile` is on PATH.
-2. `nix develop -c turnstile hook claude-stop`, when the project has a
-   `flake.nix` that puts turnstile in its devShell (see
+1. `turnstile hook claude-stop`, when `turnstile` is on PATH. In a project with
+   a `flake.nix`, outside its dev shell (neither `IN_NIX_SHELL` nor
+   `DIRENV_DIR` set), the hook runs the checks in the project's toolchain
+   ([claude/stop-hook.sh](claude/stop-hook.sh)<!--@6bb86867-->): it caches
+   `nix print-dev-env` under `.git/turnstile/`, keyed on the hash of
+   `flake.nix` and `flake.lock`, and sources it. That costs one evaluation per
+   change to those two files instead of the 25 to 44s `nix develop` takes on
+   every stop of a dirty tree. A file the flake imports is not part of the
+   key; delete `.git/turnstile/` after editing one. Without `nix`, or when the
+   build fails, the checks run bare and the hook says so.
+2. `nix develop -c turnstile hook claude-stop`, when turnstile is not on PATH,
+   the project has a `flake.nix` that puts it in its devShell (see
    [Install with Nix](#install-with-nix)) and `nix` is on PATH or at
-   `/nix/var/nix/profiles/default/bin/nix`.
+   `/nix/var/nix/profiles/default/bin/nix`. This path pays the evaluation on
+   every stop; put turnstile on PATH to get the cache.
 3. A `systemMessage` saying turnstile is not installed, exit 0.
 
 The third is fail-open but visible, on purpose: a teammate who has not adopted
@@ -224,7 +234,7 @@ agent writes code
 
 The pre-push gate alone catches a failing check after the session that caused
 it has moved on. `turnstile hook claude-stop`
-([claude/stop-hook.py](claude/stop-hook.py)<!--@198fade9-->) reads Claude Code's Stop
+([claude/stop-hook.py](claude/stop-hook.py)<!--@190a619e-->) reads Claude Code's Stop
 payload, runs the deterministic checks that are not push-only whenever the
 agent ends a turn and, on failure, blocks the stop with the report, so the
 agent fixes it while it still has the context.
