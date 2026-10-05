@@ -1,9 +1,11 @@
 """End-to-end tests: real temp repos, the real scripts, a fake `claude` on PATH."""
 
+import concurrent.futures
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -824,5 +826,36 @@ class ClaudeSettingsBlock(unittest.TestCase):
         self.assertIn("turnstile is not installed", json.loads(res.stdout)["systemMessage"])
 
 
+def all_test_names(suite: unittest.TestSuite) -> list[str]:
+    names = []
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            names.extend(all_test_names(item))
+        else:
+            names.append(item.id().removeprefix("__main__."))
+    return names
+
+
+def run_in_parallel() -> int:
+    names = all_test_names(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
+    jobs = int(os.environ.get("TURNSTILE_TEST_JOBS") or min(8, os.cpu_count() or 1))
+
+    def run(name: str) -> tuple[str, subprocess.CompletedProcess]:
+        proc = subprocess.run([sys.executable, os.path.abspath(__file__), name],
+                              capture_output=True, text=True)
+        return name, proc
+
+    failed = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        for name, proc in pool.map(run, names):
+            if proc.returncode != 0:
+                failed.append(name)
+                print(f"FAILED {name}\n{proc.stderr}", file=sys.stderr)
+    print(f"Ran {len(names)} tests, {len(failed)} failed", file=sys.stderr)
+    return 1 if failed else 0
+
+
 if __name__ == "__main__":
-    unittest.main()
+    if len(sys.argv) > 1:
+        unittest.main()
+    sys.exit(run_in_parallel())
