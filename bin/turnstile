@@ -65,6 +65,7 @@ CONFIG_NAME=".turnstile"
 repo_root() { git rev-parse --show-toplevel 2>/dev/null; }
 
 config_path() {
+  if [ -n "${CONFIG_OVERRIDE:-}" ]; then printf '%s' "$CONFIG_OVERRIDE"; return; fi
   local root; root="$(repo_root)" || return 1
   [ -n "$root" ] && printf '%s/%s' "$root" "$CONFIG_NAME"
 }
@@ -372,7 +373,9 @@ run_checks() {
   # are the slow half by two orders of magnitude, so paying for them serially
   # after a passing test suite would make the gate feel like it hangs.
   local ai_pid="" ai_log="$logdir/ai.log"
-  if [ "$ai_count" -gt 0 ] && [ -n "${TURNSTILE_NO_AI:-}" ]; then
+  if [ "$ai_count" -gt 0 ] && [ -n "${TURNSTILE_CI:-}" ]; then
+    dim "  · ai modules do not run in ci"
+  elif [ "$ai_count" -gt 0 ] && [ -n "${TURNSTILE_NO_AI:-}" ]; then
     dim "  · ai modules not run here (they run once, at push)"
   elif [ "$ai_count" -gt 0 ]; then
     if [ -x "$AI_RUNNER" ]; then
@@ -450,7 +453,7 @@ run_checks() {
     read -r rc elapsed <"$logdir/$i.status"
     if [ "$rc" -eq 0 ]; then
       printf '  %s✓%s %s %s(%ss)%s\n' "$C_GREEN" "$C_RESET" "$name" "$C_DIM" "$elapsed" "$C_RESET" >&2
-      [ -z "$rewritten" ] && : >"$CHECK_CACHE/${keys[i]}"
+      [ -z "$rewritten" ] && [ -z "${TURNSTILE_CI:-}" ] && : >"$CHECK_CACHE/${keys[i]}"
       continue
     fi
     if [ "$rc" -eq "$SKIP_STATUS" ]; then
@@ -588,10 +591,15 @@ cmd_run() {
   local label="manual run"
   [ -n "${TURNSTILE_AT_STOP:-}" ] && label="agent stop"
   run_checks "$label"
-  local failures=$?
+  verdict $? "this push would be refused"
+}
+
+# Prints the closing line of a run and returns its status.
+verdict() {
+  local failures="$1" consequence="$2"
   say ""
   if [ "$failures" -gt 0 ]; then
-    say "  ${C_RED}${C_BOLD}$failures check(s) failed${C_RESET} - this push would be refused"
+    say "  ${C_RED}${C_BOLD}$failures check(s) failed${C_RESET} - $consequence"
     say ""
     return 1
   fi
@@ -607,6 +615,40 @@ cmd_run() {
   fi
   say ""
   return 0
+}
+
+# Deterministic checks only, no pass cache, and the check list comes from the
+# base ref: a change cannot weaken the gate that judges it. What the listed
+# commands do still comes from the checked-out tree.
+cmd_ci() {
+  local base=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base)   base="${2:-}"; shift ;;
+      --base=*) base="${1#--base=}" ;;
+      *)        die "unknown option for ci: $1" ;;
+    esac
+    shift
+  done
+  [ -n "$base" ] || die "ci needs --base <ref>"
+  local root sha; root="$(repo_root)" || die "not inside a git repository"
+  sha="$(git rev-parse --verify --quiet "$base^{commit}")" || die "unknown base: $base"
+
+  if ! git cat-file -e "$sha:$CONFIG_NAME" 2>/dev/null; then
+    dim "turnstile ci: no $CONFIG_NAME at $base - nothing to run"
+    return 0
+  fi
+  CONFIG_OVERRIDE="$(mktemp "${TMPDIR:-/tmp}/turnstile-config.XXXXXX")"
+  git show "$sha:$CONFIG_NAME" >"$CONFIG_OVERRIDE"
+
+  TURNSTILE_NO_AI=1 TURNSTILE_NO_CACHE=1 TURNSTILE_CI=1
+  TURNSTILE_MODE=push
+  TURNSTILE_BASE="$(git merge-base "$sha" HEAD 2>/dev/null || printf '%s' "$sha")"
+  TURNSTILE_RANGE="${TURNSTILE_BASE}..HEAD"
+  run_checks "ci (checks from $base)"
+  local failures=$?
+  rm -f "$CONFIG_OVERRIDE"
+  verdict "$failures" "this change fails the checks of $base"
 }
 
 # The working tree as one hash, untracked files included. For the Stop hook,
@@ -828,6 +870,8 @@ usage() {
                            --no-ai     skip the ai modules (they run at push)
                            --no-cache  rerun checks that already passed on this tree
                            --stop      what an agent's turn end runs: no ai, no push-only checks
+    turnstile ci --base <ref>
+                           CI: deterministic checks only, no cache, config read from <ref>
     turnstile ai [args]    run just the ai modules (see: turnstile ai --help)
     turnstile hook claude-stop
                            Claude Code Stop hook: reads the payload on stdin
@@ -855,6 +899,7 @@ case "${1:-}" in
   uninstall)   cmd_uninstall ;;
   status)      cmd_status ;;
   run)         shift; cmd_run "$@" ;;
+  ci)          shift; cmd_ci "$@" ;;
   ai)          shift; exec "$AI_RUNNER" "$@" ;;
   hook)        shift; cmd_hook "$@" ;;
   print-claude-settings) cmd_print_claude_settings ;;

@@ -602,6 +602,130 @@ class CannotRunHere(unittest.TestCase):
         self.assertIn("e2e (could not run: no docker)", out["systemMessage"])
 
 
+class Ci(unittest.TestCase):
+    def pull_request(self, base_config: str, pr_config: str | None = None) -> Repo:
+        r = Repo(self)
+        r.config(base_config.replace("{counted}", r.counted()))
+        r.commit_all("gate")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "-c", "pr")
+        if pr_config is not None:
+            r.config(pr_config.replace("{counted}", r.counted()))
+        r.write("lib/change.txt", "the change\n")
+        r.commit_all("the pr")
+        return r
+
+    def test_a_pr_that_deletes_a_check_still_gets_it_run(self):
+        r = self.pull_request("lint: {counted}\n", "# no checks left\n")
+
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 1)
+
+    def test_a_pr_cannot_turn_a_failing_check_green(self):
+        r = self.pull_request("lint: false\n", "lint: true\n")
+
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("lint", res.stderr)
+
+    def test_a_check_the_pr_adds_is_not_run(self):
+        r = Repo(self)
+        r.config("lint: true\n")
+        r.commit_all("gate")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "-c", "pr")
+        r.config(f"lint: true\nextra: {r.counted()}\n")
+        r.commit_all("the pr")
+
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 0)
+
+    def test_checks_see_exactly_the_files_of_base_to_head(self):
+        r = Repo(self)
+        seen = os.path.join(r.tmp, "seen")
+        r.config(f'probe: printf "%s" "$TURNSTILE_CHANGED_FILES" > {seen}\n')
+        r.commit_all("gate")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "-c", "pr")
+        r.write("lib/change.txt", "the change\n")
+        r.commit_all("the pr")
+        r.write("uncommitted.txt", "not part of the pr\n")
+
+        r.turnstile("ci", "--base", "main")
+
+        with open(seen) as fh:
+            self.assertEqual(fh.read().split(), ["lib/change.txt"])
+
+    def test_ci_never_reads_or_writes_the_pass_cache(self):
+        r = Repo(self)
+        r.config(f"lint: {r.counted()}\n")
+        r.commit_all("gate")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "-c", "pr")
+        r.write("lib/change.txt", "x\n")
+        r.commit_all("the pr")
+        r.turnstile("run", "--no-ai")
+
+        r.turnstile("ci", "--base", "main")
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(r.runs(), 3)
+        self.assertNotIn("cached", res.stderr)
+
+    def test_ci_never_calls_the_model(self):
+        r = self.pull_request("ai review: block=high\nlint: true\n")
+
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.prompts(), [])
+        self.assertIn("ai modules do not run in ci", res.stderr)
+
+    def test_a_base_without_a_config_has_nothing_to_run(self):
+        r = Repo(self)
+        r.git("switch", "-q", "-c", "pr")
+        r.config(f"lint: {r.counted()}\n")
+        r.commit_all("adds the gate")
+
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 0)
+        self.assertIn("no .turnstile at main", res.stderr)
+
+    def test_ci_requires_a_resolvable_base(self):
+        r = Repo(self)
+
+        self.assertNotEqual(r.turnstile("ci").returncode, 0)
+        self.assertNotEqual(r.turnstile("ci", "--base", "no-such-ref").returncode, 0)
+
+
+class CiAction(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(HOME, "action.yml")) as fh:
+            self.action = fh.read()
+
+    def test_it_installs_nix_and_runs_ci_against_the_pull_requests_base(self):
+        self.assertIn("cachix/install-nix-action", self.action)
+        self.assertIn("github.event.pull_request.base.sha", self.action)
+        self.assertIn('ci --base "$BASE"', self.action)
+
+    def test_it_runs_inside_the_projects_dev_shell_when_there_is_a_flake(self):
+        self.assertIn("[ -f flake.nix ]", self.action)
+        self.assertIn('nix develop --no-write-lock-file -c "$turnstile" ci', self.action)
+
+    def test_the_readme_shows_how_to_use_it(self):
+        with open(os.path.join(HOME, "README.md")) as fh:
+            readme = fh.read()
+        self.assertIn("- uses: a-grasso/turnstile@main", readme)
+        self.assertIn("fetch-depth: 0", readme)
+
+
 class StopHook(unittest.TestCase):
     def stop(self, r: Repo, active: bool = False, env: dict | None = None) -> subprocess.CompletedProcess:
         payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop",

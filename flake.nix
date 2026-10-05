@@ -93,7 +93,7 @@
               mkdir -p $TMPDIR/turnstile
               cp -r ${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/share/turnstile/. $TMPDIR/turnstile/
               chmod -R u+w $TMPDIR/turnstile
-              cp ${self}/README.md $TMPDIR/turnstile/README.md
+              cp ${self}/README.md ${self}/action.yml $TMPDIR/turnstile/
               cp -r ${self}/tests $TMPDIR/turnstile/tests
               chmod -R u+w $TMPDIR/turnstile/tests
               python3 $TMPDIR/turnstile/tests/test_turnstile.py

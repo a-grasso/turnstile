@@ -144,6 +144,31 @@ environment was built or that the checks took ten seconds or more uncached
 
 Undo everything with `turnstile uninstall`.
 
+## CI
+
+`turnstile ci --base <ref>` is the check CI can trust. It runs the deterministic
+checks only (no ai modules, no pass cache) over `base..HEAD`, and reads
+`.turnstile` from `<ref>` with `git show`, so a pull request that deletes or
+weakens a check is still judged by it. What a check's command does is still the
+checked-out code's business: a PR can edit the `Makefile` that `make lint`
+runs, so protect those files with CODEOWNERS.
+
+[action.yml](action.yml)<!--@c6445728-->, a composite GitHub Action, installs nix, builds
+turnstile from the action's own checkout and runs `turnstile ci` inside the
+project's devShell when it has a `flake.nix`:
+
+```yaml
+on: pull_request
+jobs:
+  turnstile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: a-grasso/turnstile@main
+```
+
 ## Install with Nix
 
 Pin it per project with a flake input, and the version lives in `flake.lock`:
@@ -180,6 +205,7 @@ turnstile run          run this repo's checks on the working tree, without pushi
   --no-ai              skip the ai modules (they run once, at push)
   --no-cache           rerun checks that already passed on this tree
   --stop               what an agent's turn end runs: no ai, no push-only checks
+turnstile ci --base <ref>   CI: deterministic checks only, no cache, config read from <ref>
 turnstile ai [args]    run only the ai modules
 turnstile hook claude-stop        Claude Code Stop hook, payload on stdin
 turnstile print-claude-settings   the Stop hook block for .claude/settings.json
