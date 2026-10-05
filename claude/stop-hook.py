@@ -71,6 +71,13 @@ def main() -> int:
     if approval.returncode != 0:
         emit({"systemMessage": approval.stdout.strip()}, notices)
         return 0
+    state = state_path(str(payload.get("session_id") or ""))
+    summary_file = state + ".summary"
+    env["TURNSTILE_SUMMARY_FILE"] = summary_file
+    try:
+        os.unlink(summary_file)
+    except OSError:
+        pass
     started = time.monotonic()
     run = subprocess.run([TURNSTILE, "run", "--stop"], cwd=root, env=env,
                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
@@ -82,7 +89,6 @@ def main() -> int:
     if unran:
         notices.append(f"turnstile: {len(unran)} check(s) could not run, so they did not verify "
                        "this work:\n" + "\n".join(unran))
-    state = state_path(str(payload.get("session_id") or ""))
 
     if run.returncode == 0:
         try:
@@ -111,7 +117,13 @@ def main() -> int:
     report = (run.stderr + run.stdout).strip()
     if len(report) > MAX_REASON_CHARS:
         report = "...\n" + report[-MAX_REASON_CHARS:]
-    emit({"decision": "block", "reason": REASON.format(report=report)}, notices)
+    try:
+        with open(summary_file, encoding="utf-8") as fh:
+            summary = fh.read().strip()
+    except OSError:
+        summary = ""
+    reason = REASON.format(report=report)
+    emit({"decision": "block", "reason": f"{summary}\n\n{reason}" if summary else reason}, notices)
     return 0
 
 

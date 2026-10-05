@@ -475,6 +475,23 @@ run_checks() {
       && rewritten="$(git -C "$root" diff-tree -r --name-only "$tree_before" "$tree_after")"
   fi
 
+  local -a summary=()
+  local summarised
+  for i in "${!names[@]}"; do
+    [ -f "$logdir/$i.status" ] || continue
+    read -r rc elapsed <"$logdir/$i.status"
+    [ "$rc" -eq 0 ] || [ "$rc" -eq "$SKIP_STATUS" ] && continue
+    summarised="$(last_line "$logdir/$i.log")"
+    summary+=("${names[$i]}: exit $rc${summarised:+, $summarised}")
+  done
+  [ -n "$rewritten" ] && summary+=("tree: modified while ${ran[*]} ran ($(printf '%s' "$rewritten" | tr '\n' ' ' | cut -c1-120))")
+  if [ "${#summary[@]}" -gt 0 ]; then
+    say "  ${C_RED}${C_BOLD}failing${C_RESET}"
+    printf '    %s\n' "${summary[@]}" >&2
+    say ""
+    [ -n "${TURNSTILE_SUMMARY_FILE:-}" ] && printf '%s\n' "${summary[@]}" >"$TURNSTILE_SUMMARY_FILE"
+  fi
+
   for i in "${!names[@]}"; do
     if [ -n "${notes[i]:-}" ]; then printf '%s\n' "${notes[i]}" >&2; continue; fi
     [ -f "$logdir/$i.status" ] || continue

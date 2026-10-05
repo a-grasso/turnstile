@@ -1060,6 +1060,56 @@ class RepoHook(unittest.TestCase):
         self.assertEqual(r.runs(), 0)
 
 
+class FailureSummary(unittest.TestCase):
+    CONFIG = """
+        lint: echo 'src/a.go:3: undefined: x'; echo 'make: *** [lint] Error 1'; exit 2
+        ok: true
+        unit: echo 'FAIL TestWidget'; exit 1
+        e2e: echo 'no docker'; exit 77
+    """
+
+    def test_run_opens_its_failure_report_with_one_line_per_failing_check(self):
+        r = Repo(self)
+        r.config(self.CONFIG)
+
+        res = r.turnstile("run", "--no-ai")
+
+        lines = res.stderr.splitlines()
+        first_detail = next(i for i, line in enumerate(lines) if line.strip().startswith("$ "))
+        head = "\n".join(lines[:first_detail])
+        self.assertIn("lint: exit 2, src/a.go:3: undefined: x", head)
+        self.assertIn("unit: exit 1, FAIL TestWidget", head)
+        self.assertNotIn("e2e: exit", res.stderr)
+        self.assertNotIn("ok: exit", res.stderr)
+
+    def test_a_green_run_has_no_failure_report(self):
+        r = Repo(self)
+        r.config("ok: true\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertNotIn("failing", res.stderr)
+
+    def test_a_check_that_rewrites_the_tree_is_named_in_the_summary(self):
+        r = Repo(self)
+        r.config("fmt: echo formatted > lib/b.txt\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertIn("tree: modified while fmt ran", res.stderr.split("$ ")[0])
+
+    def test_the_stop_hook_reason_starts_with_the_summary_even_when_the_report_is_cut(self):
+        r = Repo(self)
+        r.config("lint: seq 1 3000; echo 'the real problem'; exit 2\nunit: echo boom; exit 1\n")
+        payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop"}
+
+        res = subprocess.run([TURNSTILE, "hook", "claude-stop"], input=json.dumps(payload),
+                             env=r.env, capture_output=True, text=True, cwd=r.root)
+
+        reason = json.loads(res.stdout)["reason"]
+        self.assertTrue(reason.startswith("lint: exit 2, the real problem\nunit: exit 1, boom\n"), reason[:200])
+
+
 class StopHook(unittest.TestCase):
     def stop(self, r: Repo, active: bool = False, env: dict | None = None) -> subprocess.CompletedProcess:
         payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop",

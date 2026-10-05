@@ -5,6 +5,9 @@ A mechanical gate on the push path.
 ```
   turnstile pre-push → origin
 
+  failing
+    test: exit 1, FAIL
+
   ✓ lint (2s)
   ✗ test (exit 1, 6s)
 
@@ -303,12 +306,17 @@ agent writes code
 
 The pre-push gate alone catches a failing check after the session that caused
 it has moved on. `turnstile hook claude-stop`
-([claude/stop-hook.py](claude/stop-hook.py)<!--@7a50b851-->) reads Claude Code's Stop
+([claude/stop-hook.py](claude/stop-hook.py)<!--@e8046668-->) reads Claude Code's Stop
 payload, runs the deterministic checks that are not push-only whenever the
 agent ends a turn and, on failure, blocks the stop with the report, so the
 agent fixes it while it still has the context.
 Nothing depends on the agent remembering to verify, which is the argument
 against skills this tool started from.
+
+When the checks fail, the block reason opens with one line per failing check,
+`name: exit N, last meaningful line`, and only then the tails of their output,
+so the cause survives a long log being cut. `turnstile run` prints the same
+lines at the top of its failure report.
 
 The loop is bounded. When the checks still fail and the tree has not changed
 since the last refusal, the agent is let go and the failure is left for you.
