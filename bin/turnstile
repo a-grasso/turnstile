@@ -152,6 +152,35 @@ read_ai_checks() {
 
 AI_RUNNER="$TURNSTILE_BIN/turnstile-ai"
 
+# ---------------------------------------------------------------- approval
+
+ALLOWED_DIR="${TURNSTILE_ALLOWED:-$HOME/.turnstile/allowed}"
+UNAPPROVED_MESSAGE="turnstile: $CONFIG_NAME changed since you approved it, run \`turnstile allow\` after reviewing it"
+
+# One approval per repo and content, as direnv does: the same file in another
+# clone is a different file to approve. The common dir is the identity, so a
+# worktree of the repo shares its approvals.
+approval_file() {
+  local cfg common; cfg="$(config_path)" || return 1
+  common="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)" || return 1
+  { printf '%s\n' "$common"; cat "$cfg"; } | git hash-object --stdin | sed "s#^#$ALLOWED_DIR/#"
+}
+
+# A repo with no config has nothing to approve.
+config_approved() {
+  local cfg; cfg="$(config_path)" || return 0
+  [ -f "$cfg" ] || return 0
+  [ -f "$(approval_file)" ]
+}
+
+cmd_allow() {
+  repo_root >/dev/null || die "not inside a git repository"
+  [ -f "$(config_path)" ] || die "no $CONFIG_NAME in $(repo_root) - nothing to approve"
+  mkdir -p "$ALLOWED_DIR"
+  repo_root >"$(approval_file)"
+  say "  ${C_GREEN}✓${C_RESET} approved $CONFIG_NAME in $(repo_root)"
+}
+
 # ---------------------------------------------------------------- push range
 
 ZERO="0000000000000000000000000000000000000000"
@@ -512,6 +541,10 @@ cmd_pre_push() {
     warn "turnstile: skipped via TURNSTILE_SKIP"
     return 0
   fi
+  if ! config_approved; then
+    say "$UNAPPROVED_MESSAGE"
+    return 1
+  fi
 
   local -a ranges=() refs=()
   local range ref lsha rsha
@@ -565,6 +598,11 @@ cmd_pre_push() {
 
 cmd_run() {
   local root; root="$(repo_root)" || die "not inside a git repository"
+
+  if ! config_approved; then
+    say "$UNAPPROVED_MESSAGE"
+    return 1
+  fi
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -659,6 +697,13 @@ cmd_tree() {
   SNAPSHOT="$(snapshot_index)" || die "could not snapshot the working tree"
   snapshot_tree
   rm -f "$SNAPSHOT"
+}
+
+cmd_approved() {
+  repo_root >/dev/null || return 0
+  config_approved && return 0
+  printf '%s\n' "$UNAPPROVED_MESSAGE"
+  return 1
 }
 
 cmd_hook() {
@@ -769,6 +814,11 @@ cmd_status() {
 
   cfg="$(config_path)"
   if [ -f "$cfg" ]; then
+    if config_approved; then
+      say "  config      ${C_GREEN}approved${C_RESET}"
+    else
+      say "  config      ${C_YELLOW}not approved${C_RESET}  (review it, then: turnstile allow)"
+    fi
     say "  checks"
     local name scope tier cmd
     while IFS=$'\037' read -r name scope tier cmd; do
@@ -865,6 +915,7 @@ usage() {
   ${C_BOLD}Usage${C_RESET}
     turnstile install      install the global hook dispatcher
     turnstile uninstall    remove it
+    turnstile allow        approve this repo's current .turnstile; runs refuse an unapproved one
     turnstile status       show gate + this repo's checks
     turnstile run          run this repo's checks on the working tree, without pushing
                            --no-ai     skip the ai modules (they run at push)
@@ -895,6 +946,8 @@ EOF
 case "${1:-}" in
   __pre-push)  shift; cmd_pre_push "$@" ;;
   __tree)      cmd_tree ;;
+  __approved)  cmd_approved ;;
+  allow)       cmd_allow ;;
   install)     cmd_install ;;
   uninstall)   cmd_uninstall ;;
   status)      cmd_status ;;

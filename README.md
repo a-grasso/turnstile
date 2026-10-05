@@ -144,6 +144,24 @@ environment was built or that the checks took ten seconds or more uncached
 
 Undo everything with `turnstile uninstall`.
 
+## Approving a config
+
+`.turnstile` is executed, and a clone or a pull can change it into code you have
+not read. So `turnstile run`, the pre-push gate and the Stop hook refuse to
+execute one whose content you have not approved:
+
+```
+turnstile: .turnstile changed since you approved it, run `turnstile allow` after reviewing it
+```
+
+`turnstile allow` approves the current content. Approvals live in
+`~/.turnstile/allowed/`, one per repo and content, the way direnv does it. The
+Stop hook shows the line as a message and does not block, because an agent that
+approves its own gate has not been gated. `turnstile ci` is exempt, since it
+reads the base branch's config and review has already approved that. Pre-push
+requires approval too, because it is the first moment a freshly cloned or pulled
+`.turnstile` would run on your machine, and refusing costs one command.
+
 ## CI
 
 `turnstile ci --base <ref>` is the check CI can trust. It runs the deterministic
@@ -200,6 +218,7 @@ global `core.hooksPath`, pointing at the store path of the pinned version.
 ```
 turnstile install      install the global hook dispatcher
 turnstile uninstall    remove it
+turnstile allow        approve this repo's current .turnstile
 turnstile status       show gate state + this repo's checks
 turnstile run          run this repo's checks on the working tree, without pushing
   --no-ai              skip the ai modules (they run once, at push)
@@ -275,7 +294,7 @@ agent writes code
 
 The pre-push gate alone catches a failing check after the session that caused
 it has moved on. `turnstile hook claude-stop`
-([claude/stop-hook.py](claude/stop-hook.py)<!--@528f0211-->) reads Claude Code's Stop
+([claude/stop-hook.py](claude/stop-hook.py)<!--@7a50b851-->) reads Claude Code's Stop
 payload, runs the deterministic checks that are not push-only whenever the
 agent ends a turn and, on failure, blocks the stop with the report, so the
 agent fixes it while it still has the context.

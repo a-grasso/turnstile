@@ -63,6 +63,7 @@ class Repo:
             "TURNSTILE_CACHE": os.path.join(self.tmp, "cache-ai"),
             "TURNSTILE_CHECK_CACHE": os.path.join(self.tmp, "cache-checks"),
             "TURNSTILE_STATE": os.path.join(self.tmp, "state"),
+            "TURNSTILE_ALLOWED": os.path.join(self.tmp, "allowed"),
             "FAKE_CLAUDE_LOG": self.claude_log,
             "FAKE_CLAUDE_BLOCK_FLAG": self.block_flag,
             "NO_COLOR": "1",
@@ -89,8 +90,10 @@ class Repo:
         with open(path, "w") as fh:
             fh.write(content)
 
-    def config(self, text: str) -> None:
+    def config(self, text: str, allow: bool = True) -> None:
         self.write(".turnstile", textwrap.dedent(text))
+        if allow:
+            self.turnstile("allow")
 
     def git(self, *args: str) -> str:
         return subprocess.run(["git", *args], cwd=self.root, env=self.env, check=True,
@@ -724,6 +727,116 @@ class CiAction(unittest.TestCase):
             readme = fh.read()
         self.assertIn("- uses: a-grasso/turnstile@main", readme)
         self.assertIn("fetch-depth: 0", readme)
+
+
+UNAPPROVED = "turnstile: .turnstile changed since you approved it, run `turnstile allow` after reviewing it"
+
+
+class Allow(unittest.TestCase):
+    def unapproved(self) -> Repo:
+        r = Repo(self)
+        r.config(f"lint: {r.counted()}\n", allow=False)
+        return r
+
+    def test_an_unapproved_config_is_not_executed(self):
+        r = self.unapproved()
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn(UNAPPROVED, res.stderr)
+        self.assertEqual(r.runs(), 0)
+
+    def test_allow_approves_the_current_content(self):
+        r = self.unapproved()
+
+        allowed = r.turnstile("allow")
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 1)
+
+    def test_editing_the_config_withdraws_the_approval(self):
+        r = self.unapproved()
+        r.turnstile("allow")
+        r.write(".turnstile", f"lint: {r.counted()} && true\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn(UNAPPROVED, res.stderr)
+        self.assertEqual(r.runs(), 0)
+
+    def test_an_approval_does_not_carry_over_to_another_clone(self):
+        r = self.unapproved()
+        r.turnstile("allow")
+        r.commit_all("config")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        clone = os.path.join(r.tmp, "clone")
+        subprocess.run(["git", "clone", "-q", r.remote, clone], env=r.env, check=True)
+
+        res = subprocess.run([TURNSTILE, "run", "--no-ai"], cwd=clone, env=r.env,
+                             capture_output=True, text=True)
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn(UNAPPROVED, res.stderr)
+
+    def test_a_push_with_an_unapproved_config_is_refused(self):
+        r = self.unapproved()
+        r.commit_all("config")
+
+        refused = r.pre_push()
+        r.turnstile("allow")
+        allowed = r.pre_push()
+
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn(UNAPPROVED, refused.stderr)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(r.runs(), 1)
+
+    def test_ci_reads_the_base_branch_and_needs_no_approval(self):
+        r = self.unapproved()
+        r.commit_all("config")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "-c", "pr")
+        r.write("lib/change.txt", "x\n")
+        r.commit_all("the pr")
+
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 1)
+
+    def test_the_stop_hook_says_so_without_blocking_or_running_anything(self):
+        r = self.unapproved()
+        payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop"}
+
+        res = subprocess.run([TURNSTILE, "hook", "claude-stop"], input=json.dumps(payload),
+                             env=r.env, capture_output=True, text=True, cwd=r.root)
+
+        out = json.loads(res.stdout)
+        self.assertNotIn("decision", out)
+        self.assertEqual(out["systemMessage"], UNAPPROVED)
+        self.assertEqual(r.runs(), 0)
+
+    def test_status_shows_whether_the_config_is_approved(self):
+        r = self.unapproved()
+
+        before = r.turnstile("status").stderr
+        r.turnstile("allow")
+        after = r.turnstile("status").stderr
+
+        self.assertIn("not approved", before)
+        self.assertNotIn("not approved", after)
+        self.assertIn("approved", after)
+
+    def test_allow_without_a_config_says_there_is_nothing_to_approve(self):
+        r = Repo(self)
+
+        res = r.turnstile("allow")
+
+        self.assertNotEqual(res.returncode, 0)
 
 
 class StopHook(unittest.TestCase):

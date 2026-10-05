@@ -66,6 +66,11 @@ def main() -> int:
 
     notices: list[str] = []
     env = {**os.environ, "NO_COLOR": "1"}
+    approval = subprocess.run([TURNSTILE, "__approved"], cwd=root, env=env, capture_output=True,
+                              text=True, stdin=subprocess.DEVNULL)
+    if approval.returncode != 0:
+        emit({"systemMessage": approval.stdout.strip()}, notices)
+        return 0
     started = time.monotonic()
     run = subprocess.run([TURNSTILE, "run", "--stop"], cwd=root, env=env,
                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
