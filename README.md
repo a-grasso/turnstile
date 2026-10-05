@@ -226,6 +226,14 @@ the checks and refuses a run that changed it, listing the files. Checks run
 concurrently, so the report names the batch rather than one check. Commit what
 is right and run again; the second run passes.
 
+**Cannot run here.** A check that exits 77 (the autotools skip code) could not
+run: no docker, a missing credential, a dependency a clean checkout lacks. It
+prints `? name (could not run: <last line of output>)`, is not a failure and is
+never cached. The summary counts it, as in `all checks passed (1 check(s) could
+not run)`, the way it counts ai modules that could not run, so a quiet gate
+never reads as a thorough one. The Stop hook lets the agent stop and says what
+did not run.
+
 Checks get `TURNSTILE_RANGE`, `TURNSTILE_BASE`, `TURNSTILE_CHANGED_FILES` and
 `TURNSTILE_DIFF_FILE` (the change as a patch) so they can scope themselves
 further.
@@ -241,7 +249,7 @@ agent writes code
 
 The pre-push gate alone catches a failing check after the session that caused
 it has moved on. `turnstile hook claude-stop`
-([claude/stop-hook.py](claude/stop-hook.py)<!--@e9e4985a-->) reads Claude Code's Stop
+([claude/stop-hook.py](claude/stop-hook.py)<!--@528f0211-->) reads Claude Code's Stop
 payload, runs the deterministic checks that are not push-only whenever the
 agent ends a turn and, on failure, blocks the stop with the report, so the
 agent fixes it while it still has the context.

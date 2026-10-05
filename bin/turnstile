@@ -304,6 +304,18 @@ check_key() {
 
 # ---------------------------------------------------------------- run checks
 
+# Exit status a check uses for "cannot run here" (autotools' skip code): not a
+# failure, never cached, and counted in the summary so a quiet gate never reads
+# as a thorough one.
+SKIP_STATUS=77
+
+# The last line of a log that says something: blank lines, bare punctuation and
+# make's own "*** Error" trailer are what a failing command ends in.
+last_line() {
+  grep -v -E '^[[:space:]]*([[:punct:]]*|make(\[[0-9]+\])?: \*\*\*.*)$' "$1" \
+    | tail -n 1 | sed -e 's/^[[:space:]]*//' | cut -c1-160
+}
+
 # Runs every configured check, buffering output and surfacing it only on
 # failure. Returns the number of failures.
 #
@@ -319,6 +331,7 @@ check_key() {
 # contributions, that is the fix, not a sandbox.
 run_checks() {
   local label="${1:-turnstile}"
+  TURNSTILE_UNRUNNABLE=0
   local -a names=() scopes=() tiers=() cmds=()
   local name scope tier cmd
 
@@ -440,6 +453,11 @@ run_checks() {
       [ -z "$rewritten" ] && : >"$CHECK_CACHE/${keys[i]}"
       continue
     fi
+    if [ "$rc" -eq "$SKIP_STATUS" ]; then
+      TURNSTILE_UNRUNNABLE=$((TURNSTILE_UNRUNNABLE + 1))
+      printf '  %s?%s %s %s(could not run: %s)%s\n' "$C_YELLOW" "$C_RESET" "$name" "$C_DIM" "$(last_line "$logdir/$i.log")" "$C_RESET" >&2
+      continue
+    fi
     failures=$((failures + 1))
     printf '  %s✗%s %s %s(exit %s, %ss)%s\n' "$C_RED" "$C_RESET" "$name" "$C_DIM" "$rc" "$elapsed" "$C_RESET" >&2
     say ""
@@ -506,7 +524,7 @@ cmd_pre_push() {
   # Every pushed ref is gated, in its own pass. Rare enough that the repeated
   # deterministic checks do not matter, and the AI cache means an identical
   # diff across two refs is not paid for twice.
-  local failures=0 i degraded=0
+  local failures=0 i degraded=0 unrunnable=0
   for i in "${!ranges[@]}"; do
     TURNSTILE_MODE=push
     TURNSTILE_RANGE="${ranges[$i]}"
@@ -519,7 +537,12 @@ cmd_pre_push() {
     run_checks "$label"
     failures=$((failures + $?))
     degraded=$((degraded + ${TURNSTILE_AI_DEGRADED:-0}))
+    unrunnable=$((unrunnable + TURNSTILE_UNRUNNABLE))
   done
+
+  if [ "$unrunnable" -gt 0 ] && [ "$failures" -eq 0 ]; then
+    warn "turnstile: $unrunnable check(s) could not run - this push was NOT verified by them"
+  fi
 
   if [ "$degraded" -gt 0 ] && [ "$failures" -eq 0 ]; then
     warn "turnstile: $degraded ai module(s) could not run - this push was NOT reviewed by them"
@@ -572,8 +595,13 @@ cmd_run() {
     say ""
     return 1
   fi
+  local unran=""
+  [ "$TURNSTILE_UNRUNNABLE" -gt 0 ] && unran="$TURNSTILE_UNRUNNABLE check(s)"
   if [ "${TURNSTILE_AI_DEGRADED:-0}" -gt 0 ]; then
-    say "  ${C_GREEN}${C_BOLD}all checks passed${C_RESET} ${C_YELLOW}(${TURNSTILE_AI_DEGRADED} ai module(s) could not run)${C_RESET}"
+    unran="${unran:+$unran, }${TURNSTILE_AI_DEGRADED} ai module(s)"
+  fi
+  if [ -n "$unran" ]; then
+    say "  ${C_GREEN}${C_BOLD}all checks passed${C_RESET} ${C_YELLOW}($unran could not run)${C_RESET}"
   else
     say "  ${C_GREEN}${C_BOLD}all checks passed${C_RESET}"
   fi

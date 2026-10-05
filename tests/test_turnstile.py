@@ -540,6 +540,68 @@ class DeltaReview(unittest.TestCase):
         self.assertEqual(len(self.r.prompts()), calls)
 
 
+class CannotRunHere(unittest.TestCase):
+    def test_exit_77_is_reported_with_the_last_line_and_is_not_a_failure(self):
+        r = Repo(self)
+        r.config("e2e: echo noise; echo 'docker is not running'; exit 77\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("? e2e (could not run: docker is not running)", res.stderr)
+        self.assertNotIn("check(s) failed", res.stderr)
+
+    def test_the_summary_counts_the_checks_that_could_not_run(self):
+        r = Repo(self)
+        r.config("a: exit 77\nb: exit 77\nc: true\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertIn("all checks passed (2 check(s) could not run)", res.stderr)
+
+    def test_a_check_that_could_not_run_is_never_cached(self):
+        r = Repo(self)
+        r.config(f"e2e: {r.counted()}; exit 77\n")
+
+        r.turnstile("run", "--no-ai")
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(r.runs(), 2)
+        self.assertNotIn("cached", res.stderr)
+
+    def test_it_does_not_hide_a_real_failure_beside_it(self):
+        r = Repo(self)
+        r.config("e2e: exit 77\nlint: exit 1\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("1 check(s) failed", res.stderr)
+
+    def test_a_push_goes_through_but_says_it_was_not_fully_verified(self):
+        r = Repo(self)
+        r.config("e2e: exit 77\n")
+        r.commit_all("config")
+
+        res = r.pre_push()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("1 check(s) could not run", res.stderr)
+
+    def test_the_stop_hook_lets_the_agent_stop_and_says_what_did_not_run(self):
+        r = Repo(self)
+        r.config("e2e: echo no docker; exit 77\n")
+        payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop"}
+
+        res = subprocess.run([TURNSTILE, "hook", "claude-stop"], input=json.dumps(payload),
+                             env=r.env, capture_output=True, text=True, cwd=r.root)
+
+        out = json.loads(res.stdout)
+        self.assertNotIn("decision", out)
+        self.assertIn("1 check(s) could not run", out["systemMessage"])
+        self.assertIn("e2e (could not run: no docker)", out["systemMessage"])
+
+
 class StopHook(unittest.TestCase):
     def stop(self, r: Repo, active: bool = False, env: dict | None = None) -> subprocess.CompletedProcess:
         payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop",

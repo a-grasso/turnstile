@@ -11,6 +11,7 @@ Repos without a `.turnstile` are left alone.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -72,6 +73,10 @@ def main() -> int:
     if elapsed >= SLOW_NOTICE_SECONDS:
         notices.append(f"turnstile: the checks took {elapsed:.0f}s (not cached); "
                        "later stops reuse what passed on an unchanged tree")
+    unran = re.findall(r"^\s*\? (?!ai )(.+\(could not run: .*\))$", run.stderr, re.MULTILINE)
+    if unran:
+        notices.append(f"turnstile: {len(unran)} check(s) could not run, so they did not verify "
+                       "this work:\n" + "\n".join(unran))
     state = state_path(str(payload.get("session_id") or ""))
 
     if run.returncode == 0:
