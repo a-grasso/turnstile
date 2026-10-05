@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"${CLAUDE_PROJECT_DIR:-.}\" || exit 0; command -v turnstile >/dev/null && exec turnstile hook claude-stop; if [ -f flake.nix ]; then for n in nix /nix/var/nix/profiles/default/bin/nix; do command -v $n >/dev/null && exec $n develop -c turnstile hook claude-stop; done; fi; echo '{\"systemMessage\": \"turnstile is not installed, so the checks of this repo did not run at agent stop. See https://github.com/a-grasso/turnstile#install\"}'",
+            "timeout": 900
+          }
+        ]
+      }
+    ]
+  }
+}

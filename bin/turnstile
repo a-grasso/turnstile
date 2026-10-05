@@ -591,6 +591,20 @@ cmd_tree() {
   rm -f "$SNAPSHOT"
 }
 
+cmd_hook() {
+  case "${1:-}" in
+    claude-stop)
+      command -v python3 >/dev/null 2>&1 || die "python3 not on PATH - the claude-stop hook cannot run"
+      exec python3 "$TURNSTILE_HOME/claude/stop-hook.py"
+      ;;
+    *) die "unknown hook: ${1:-}  (known: claude-stop)" ;;
+  esac
+}
+
+cmd_print_claude_settings() {
+  cat "$TURNSTILE_HOME/claude/settings.json"
+}
+
 cmd_install() {
   local dispatch="$TURNSTILE_HOME/hooks/dispatch"
   [ -x "$dispatch" ] || die "missing or non-executable: $dispatch"
@@ -788,6 +802,10 @@ usage() {
                            --no-cache  rerun checks that already passed on this tree
                            --stop      what an agent's turn end runs: no ai, no push-only checks
     turnstile ai [args]    run just the ai modules (see: turnstile ai --help)
+    turnstile hook claude-stop
+                           Claude Code Stop hook: reads the payload on stdin
+    turnstile print-claude-settings
+                           the Stop hook block for a project's .claude/settings.json
     turnstile doctor       diagnose the installation
 
   ${C_BOLD}Per-repo config${C_RESET} (${CONFIG_NAME} in the repo root)
@@ -811,6 +829,8 @@ case "${1:-}" in
   status)      cmd_status ;;
   run)         shift; cmd_run "$@" ;;
   ai)          shift; exec "$AI_RUNNER" "$@" ;;
+  hook)        shift; cmd_hook "$@" ;;
+  print-claude-settings) cmd_print_claude_settings ;;
   doctor)      cmd_doctor ;;
   ""|-h|--help|help) usage ;;
   --version)   printf '%s\n' "$TURNSTILE_VERSION" ;;

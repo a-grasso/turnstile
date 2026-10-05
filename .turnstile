@@ -1,6 +1,6 @@
 # turnstile gates itself.
 syntax-sh: bash -n bin/turnstile && bash -n hooks/dispatch
-syntax-py: python3 -m py_compile claude/no-bypass.py claude/verify-on-stop.py bin/turnstile-ai
+syntax-py: python3 -m py_compile claude/stop-hook.py bin/turnstile-ai
 tests [bin/** claude/** hooks/** modules/** tests/**]: python3 tests/test_turnstile.py
 # Scope to the pushed range when the gate provides one, and fall back to the
 # index for a pre-commit invocation. `--cached` alone was a no-op at pre-push:

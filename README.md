@@ -42,26 +42,18 @@ most and the moment it is least likely to be invoked.
 
 A hook has no judgment. It is on the road out or it isn't.
 
-Three enforcement points, covering different traffic:
+Two enforcement points, covering different traffic:
 
 | | catches | can be bypassed by |
 |---|---|---|
 | `pre-push` hook | you, agents, the IDE, anything calling git | a human typing `--no-verify` |
-| `PreToolUse` hook | Claude Code's Bash tool | you, by editing settings.json |
-| `Stop` hook | a Claude Code agent ending its turn on a red tree | you, by editing settings.json |
+| `Stop` hook | a Claude Code agent ending its turn on a red tree | editing `.claude/settings.json` |
 
-The `Stop` hook is the early one; see [the agent's loop](#the-agents-loop). The
-first two are a pair. `--no-verify` is the right escape hatch for a person: they
-have decided to take responsibility. It is the wrong one for an agent, which
-has decided nothing and is routing around a failing check because that makes
-the task look finished. So the second hook closes it, for the agent only.
-
-**How firmly it closes it: not very.** The blocker is regex over the command
-string, so `sh -c` wrapping, quote splitting, an alias, or a helper script that
-calls `git push --no-verify` itself all walk straight past it. It raises the
-cost of an accidental bypass from zero to deliberate; it is not a security
-boundary and cannot become one at this layer. The `pre-push` hook is the actual
-gate. This only stops the model from reflexively reaching for the hatch.
+The `Stop` hook is the early one; see [the agent's loop](#the-agents-loop).
+`--no-verify` is the right escape hatch for a person: they have decided to take
+responsibility. turnstile does not try to close it for an agent. The `pre-push`
+hook is the actual gate, and the `Stop` hook makes reaching for the hatch
+unnecessary by catching a red tree a turn earlier.
 
 ## Install
 
@@ -96,12 +88,42 @@ Repos without one pass straight through. A check with a bracketed scope runs
 only when the change touches a file its globs match; see
 [scoped checks](#scoped-checks-and-the-pass-cache). See [examples/.turnstile](examples/.turnstile)<!--@13caced8-->.
 
-For the agent-side half, point a Claude Code `PreToolUse` hook at
-[claude/no-bypass.py](claude/no-bypass.py)<!--@360addfc--> and a `Stop` hook at
-[claude/verify-on-stop.py](claude/verify-on-stop.py)<!--@c9bb5cd3-->. Each docstring has its
-settings.json block. Put them in your user settings rather than a repo's: both
-do nothing in a repo without a `.turnstile`, so a teammate who has not
-installed turnstile is never affected.
+For the agent-side half, commit a Claude Code `Stop` hook to the project's
+`.claude/settings.json`, so contributors install nothing for it.
+`turnstile print-claude-settings` prints the block, which is
+[claude/settings.json](claude/settings.json)<!--@2eaf8487-->:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"${CLAUDE_PROJECT_DIR:-.}\" || exit 0; command -v turnstile >/dev/null && exec turnstile hook claude-stop; if [ -f flake.nix ]; then for n in nix /nix/var/nix/profiles/default/bin/nix; do command -v $n >/dev/null && exec $n develop -c turnstile hook claude-stop; done; fi; echo '{\"systemMessage\": \"turnstile is not installed, so the checks of this repo did not run at agent stop. See https://github.com/a-grasso/turnstile#install\"}'",
+            "timeout": 900
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The command runs in the project directory and picks the first of three:
+
+1. `turnstile hook claude-stop`, when `turnstile` is on PATH.
+2. `nix develop -c turnstile hook claude-stop`, when the project has a
+   `flake.nix` that puts turnstile in its devShell (see
+   [Install with Nix](#install-with-nix)) and `nix` is on PATH or at
+   `/nix/var/nix/profiles/default/bin/nix`.
+3. A `systemMessage` saying turnstile is not installed, exit 0.
+
+The third is fail-open but visible, on purpose: a teammate who has not adopted
+turnstile is never blocked, and sees that the checks did not run. The fallback
+lives in the settings command and not in turnstile because it has to work when
+turnstile is absent. Repos without a `.turnstile` are left alone either way.
 
 Undo everything with `turnstile uninstall`.
 
@@ -142,6 +164,8 @@ turnstile run          run this repo's checks on the working tree, without pushi
   --no-cache           rerun checks that already passed on this tree
   --stop               what an agent's turn end runs: no ai, no push-only checks
 turnstile ai [args]    run only the ai modules
+turnstile hook claude-stop        Claude Code Stop hook, payload on stdin
+turnstile print-claude-settings   the Stop hook block for .claude/settings.json
 turnstile doctor       diagnose the installation
 ```
 
@@ -199,9 +223,11 @@ agent writes code
 ```
 
 The pre-push gate alone catches a failing check after the session that caused
-it has moved on. [claude/verify-on-stop.py](claude/verify-on-stop.py)<!--@c9bb5cd3--> runs the
-deterministic checks that are not push-only whenever the agent ends a turn and, on failure, blocks the
-stop with the report, so the agent fixes it while it still has the context.
+it has moved on. `turnstile hook claude-stop`
+([claude/stop-hook.py](claude/stop-hook.py)<!--@198fade9-->) reads Claude Code's Stop
+payload, runs the deterministic checks that are not push-only whenever the
+agent ends a turn and, on failure, blocks the stop with the report, so the
+agent fixes it while it still has the context.
 Nothing depends on the agent remembering to verify, which is the argument
 against skills this tool started from.
 
@@ -435,9 +461,8 @@ is the second deterministic check on this repo's own docs.
 A reference opts in by carrying an empty pin, `<!--@-->` after the link, and
 `reflock stamp` fills it with a fingerprint of the target as it stands. `reflock
 check` recomputes and compares: a target that changed is `DRIFTED`, a target
-that no longer exists is `DANGLING`. Six references in this file are pinned,
-each one a place where the prose makes a claim about a file rather than merely
-linking to it.
+that no longer exists is `DANGLING`. Each pinned reference in this file is a place where the prose makes a claim
+about a file rather than merely linking to it.
 
 ```sh
 reflock check                       # what the `refs` gate runs

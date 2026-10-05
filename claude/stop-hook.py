@@ -1,38 +1,12 @@
 #!/usr/bin/env python3
-"""turnstile - Claude Code Stop hook: the agent does not finish red.
+"""Claude Code Stop hook behind `turnstile hook claude-stop`.
 
-The pre-push gate catches a failing check after the session that caused it has
-moved on. This runs the same deterministic checks when the agent ends its turn,
-and on failure hands the reasons back so it fixes them while it still has the
-context. It fires because the turn ended, not because the agent remembered to
-verify.
+Reads the Stop payload on stdin and runs `turnstile run --stop`. On red it
+blocks the stop with the report, so the agent fixes it while it still has the
+context. The loop is bounded: when the checks still fail and the tree has not
+changed since the last refusal, the agent is let go with a systemMessage.
 
-Only the deterministic checks run here. The ai modules cost money per call and
-run once, at push. Passes are cached per tree, so a turn that changed nothing
-costs nothing.
-
-The corrective loop is bounded: if the checks still fail and the tree has not
-changed since the last refusal, the agent is allowed to stop and the failure is
-left for the user.
-
-Repos without a `.turnstile` are left alone. Wire up in settings.json (the
-timeout is in seconds and must cover the slowest test suite):
-
-    {
-      "hooks": {
-        "Stop": [
-          {
-            "hooks": [
-              {
-                "type": "command",
-                "command": "/absolute/path/to/turnstile/claude/verify-on-stop.py",
-                "timeout": 900
-              }
-            ]
-          }
-        ]
-      }
-    }
+Repos without a `.turnstile` are left alone.
 """
 
 import json

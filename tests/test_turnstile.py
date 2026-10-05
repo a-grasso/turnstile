@@ -10,7 +10,7 @@ import unittest
 
 HOME = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TURNSTILE = os.path.join(HOME, "bin", "turnstile")
-STOP_HOOK = os.path.join(HOME, "claude", "verify-on-stop.py")
+SETTINGS = os.path.join(HOME, "claude", "settings.json")
 
 FAKE_CLAUDE = """#!/usr/bin/env python3
 import json, os, sys, time
@@ -538,8 +538,8 @@ class StopHook(unittest.TestCase):
     def stop(self, r: Repo, active: bool = False) -> subprocess.CompletedProcess:
         payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop",
                    "stop_hook_active": active}
-        return subprocess.run([STOP_HOOK], input=json.dumps(payload), env=r.env,
-                              capture_output=True, text=True, cwd=r.root)
+        return subprocess.run([TURNSTILE, "hook", "claude-stop"], input=json.dumps(payload),
+                              env=r.env, capture_output=True, text=True, cwd=r.root)
 
     def test_repo_without_turnstile_config_is_left_alone(self):
         r = Repo(self)
@@ -605,6 +605,80 @@ class StopHook(unittest.TestCase):
         self.stop(r)
 
         self.assertEqual(r.prompts(), [])
+
+    def test_malformed_payload_never_breaks_the_session(self):
+        r = Repo(self)
+        r.config("unit: false\n")
+
+        res = r.turnstile("hook", "claude-stop", stdin="not json")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.strip(), "")
+
+    def test_unknown_hook_is_refused(self):
+        r = Repo(self)
+
+        res = r.turnstile("hook", "nope")
+
+        self.assertNotEqual(res.returncode, 0)
+
+
+class ClaudeSettingsBlock(unittest.TestCase):
+    def setUp(self):
+        with open(SETTINGS) as fh:
+            self.command = json.load(fh)["hooks"]["Stop"][0]["hooks"][0]["command"]
+        self.tmp = tempfile.mkdtemp(prefix="turnstile-shim-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.project = os.path.join(self.tmp, "project")
+        os.makedirs(self.project)
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+
+    def fake(self, name: str) -> None:
+        path = os.path.join(self.bin, name)
+        with open(path, "w") as fh:
+            fh.write(f'#!/bin/sh\necho "{name} $*"\n')
+        os.chmod(path, 0o755)
+
+    def run_hook(self) -> subprocess.CompletedProcess:
+        env = {"PATH": self.bin, "CLAUDE_PROJECT_DIR": self.project}
+        return subprocess.run(["/bin/sh", "-c", self.command], input="{}", env=env,
+                              capture_output=True, text=True, cwd=self.tmp)
+
+    def test_print_claude_settings_prints_the_committed_block(self):
+        res = subprocess.run([TURNSTILE, "print-claude-settings"], capture_output=True, text=True)
+
+        with open(SETTINGS) as fh:
+            self.assertEqual(res.stdout, fh.read())
+
+    def test_readme_shows_the_committed_block(self):
+        with open(SETTINGS) as fh, open(os.path.join(HOME, "README.md")) as readme:
+            self.assertIn(fh.read(), readme.read())
+
+    def test_installed_turnstile_is_used_first(self):
+        self.fake("turnstile")
+        self.fake("nix")
+        open(os.path.join(self.project, "flake.nix"), "w").close()
+
+        res = self.run_hook()
+
+        self.assertEqual(res.stdout.strip(), "turnstile hook claude-stop")
+
+    def test_a_flake_without_turnstile_on_path_goes_through_nix_develop(self):
+        self.fake("nix")
+        open(os.path.join(self.project, "flake.nix"), "w").close()
+
+        res = self.run_hook()
+
+        self.assertEqual(res.stdout.strip(), "nix develop -c turnstile hook claude-stop")
+
+    def test_without_turnstile_or_a_flake_it_says_so_and_lets_the_agent_stop(self):
+        self.fake("nix")
+
+        res = self.run_hook()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("turnstile is not installed", json.loads(res.stdout)["systemMessage"])
 
 
 if __name__ == "__main__":
