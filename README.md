@@ -142,6 +142,13 @@ runs, and a `systemMessage` afterwards says what was slow, either that the dev
 environment was built or that the checks took ten seconds or more uncached
 (`TURNSTILE_SLOW_NOTICE` sets that threshold, in seconds).
 
+To leave global git config alone, `turnstile install --repo` writes only this
+repo's `.git/hooks/pre-push`, which calls `turnstile pre-push` (and says so,
+without blocking, when turnstile is missing). A hook manager can call
+`turnstile pre-push "$@"` itself, with git's stdin passed through: husky does
+that by default and lefthook needs `use_stdin: true`. The pre-commit framework
+does not forward stdin, so use `install --repo` there.
+
 Undo everything with `turnstile uninstall`.
 
 ## Approving a config
@@ -217,7 +224,9 @@ global `core.hooksPath`, pointing at the store path of the pinned version.
 
 ```
 turnstile install      install the global hook dispatcher
-turnstile uninstall    remove it
+turnstile install --repo   write only this repo's .git/hooks/pre-push
+turnstile uninstall    remove it (--repo: this repo's hook)
+turnstile pre-push     the gate for hook managers, git's pre-push stdin on stdin
 turnstile allow        approve this repo's current .turnstile
 turnstile status       show gate state + this repo's checks
 turnstile run          run this repo's checks on the working tree, without pushing
@@ -667,11 +676,15 @@ ability to edit the tree it is gating. A module can opt back in via
 cannot express anything but a list of commands cannot grow into a second
 configuration language.
 
-**Checks run in-tree, not in a worktree.** They see your working directory as
-it is. That is wrong for validation of a *pushed* range and right for a
-prototype that has to stay fast. The pass cache is keyed on that same working
-tree, so it never claims more than the checks saw. Worktree isolation belongs
-with the review stage, where it actually buys something.
+**Push checks the commits, not the tree.** When the working tree is exactly
+the pushed commit, the checks run in place. Otherwise (uncommitted work, another
+branch checked out, a branch pushed that is not checked out) they run in a
+temporary `git worktree` of the pushed commit, with hooks off, removed
+afterwards. A fresh checkout lacks what is untracked (`node_modules`, `.venv`),
+so a check that cannot run there should exit 77: the push then reports `could
+not verify <sha>` instead of going red. The pass cache is keyed on tree content,
+so both modes share it. `turnstile run` still checks the working tree, since
+checking uncommitted work is its job.
 
 **Every pushed ref is gated, in its own pass.** An earlier cut checked only the
 first content-bearing ref and warned about the rest, which was the wrong

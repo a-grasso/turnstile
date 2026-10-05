@@ -839,6 +839,227 @@ class Allow(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
 
 
+class PushedCommits(unittest.TestCase):
+    def push_of(self, r: Repo, ref: str, sha: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        remote = r.git("rev-parse", "origin/main").strip()
+        zero = "0" * 40
+        known = r.git("ls-remote", "origin", ref).split()
+        return subprocess.run([TURNSTILE, "__pre-push", "origin"], cwd=r.root,
+                              env={**r.env, **(env or {})}, capture_output=True, text=True,
+                              input=f"{ref} {sha} {ref} {known[0] if known else zero}\n")
+
+    def head(self, r: Repo) -> str:
+        return r.git("rev-parse", "HEAD").strip()
+
+    def test_a_dirty_tree_does_not_stand_in_for_the_commits_being_pushed(self):
+        r = Repo(self)
+        r.config("clean: test ! -e junk.txt\n")
+        r.commit_all("config")
+        r.write("junk.txt", "untracked, not part of the push\n")
+
+        res = self.push_of(r, "refs/heads/main", self.head(r))
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("temporary worktree", res.stderr)
+
+    def test_uncommitted_edits_do_not_hide_a_bad_commit(self):
+        r = Repo(self)
+        r.config("content: grep -q good a.txt\n")
+        r.write("a.txt", "bad\n")
+        r.commit_all("bad commit")
+        r.write("a.txt", "good\n")
+
+        res = self.push_of(r, "refs/heads/main", self.head(r))
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+
+    def test_a_branch_that_is_not_checked_out_is_checked_as_pushed(self):
+        r = Repo(self)
+        r.config("content: grep -q good a.txt\n")
+        r.commit_all("config")
+        r.git("switch", "-q", "-c", "feature")
+        r.write("a.txt", "bad\n")
+        r.commit_all("bad on feature")
+        feature = self.head(r)
+        r.git("switch", "-q", "main")
+        r.write("a.txt", "good\n")
+        r.commit_all("good on main")
+
+        res = self.push_of(r, "refs/heads/feature", feature)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+
+    def test_a_clean_tree_that_matches_the_push_runs_in_place(self):
+        r = Repo(self)
+        where = os.path.join(r.tmp, "where")
+        r.config(f'where: pwd -P > {where}\n')
+        r.commit_all("config")
+
+        res = self.push_of(r, "refs/heads/main", self.head(r))
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("temporary worktree", res.stderr)
+        with open(where) as fh:
+            self.assertEqual(fh.read().strip(), os.path.realpath(r.root))
+
+    def test_the_temporary_worktree_is_removed_afterwards(self):
+        r = Repo(self)
+        where = os.path.join(r.tmp, "where")
+        r.config(f'where: pwd -P > {where}\n')
+        r.commit_all("config")
+        r.write("junk.txt", "dirty\n")
+
+        self.push_of(r, "refs/heads/main", self.head(r))
+
+        with open(where) as fh:
+            checked_out_at = fh.read().strip()
+        self.assertNotEqual(checked_out_at, os.path.realpath(r.root))
+        self.assertFalse(os.path.exists(checked_out_at))
+        self.assertEqual(len(r.git("worktree", "list").strip().splitlines()), 1)
+
+    def test_checks_that_cannot_run_in_the_checkout_are_not_red(self):
+        r = Repo(self)
+        r.config("e2e: echo 'node_modules missing'; exit 77\n")
+        r.commit_all("config")
+        r.write("junk.txt", "dirty\n")
+        sha = self.head(r)
+
+        res = self.push_of(r, "refs/heads/main", sha)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"could not verify {sha[:7]}", res.stderr)
+
+    def test_it_works_with_the_git_environment_a_hook_inherits(self):
+        r = Repo(self)
+        r.config("clean: test ! -e junk.txt\n")
+        r.commit_all("config")
+        r.write("junk.txt", "dirty\n")
+
+        res = self.push_of(r, "refs/heads/main", self.head(r),
+                           env={"GIT_DIR": os.path.join(r.root, ".git")})
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_the_pass_cache_is_shared_between_the_checkout_and_the_tree(self):
+        r = Repo(self)
+        r.config(f"lint: {r.counted()}\n")
+        r.commit_all("config")
+        r.write("junk.txt", "dirty\n")
+        self.push_of(r, "refs/heads/main", self.head(r))
+        r.git("clean", "-fdq")
+
+        res = self.push_of(r, "refs/heads/main", self.head(r))
+
+        self.assertEqual(r.runs(), 1)
+        self.assertIn("cached", res.stderr)
+
+
+class RepoHook(unittest.TestCase):
+    def setUp(self):
+        r = self.r = Repo(self)
+        os.symlink(TURNSTILE, os.path.join(r.fakebin, "turnstile"))
+        self.hook = os.path.join(r.root, ".git", "hooks", "pre-push")
+
+    def push(self, *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "push", *extra, "origin", "HEAD:refs/heads/topic"],
+                              cwd=self.r.root, env=self.r.env, capture_output=True, text=True)
+
+    def test_install_repo_writes_a_pre_push_hook_that_gates_a_real_push(self):
+        r = self.r
+        r.config("lint: false\n")
+        r.commit_all("config")
+
+        installed = r.turnstile("install", "--repo")
+        refused = self.push()
+        bypassed = self.push("--no-verify")
+
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertTrue(os.access(self.hook, os.X_OK))
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("push refused", refused.stderr)
+        self.assertEqual(bypassed.returncode, 0, bypassed.stderr)
+
+    def test_a_passing_push_goes_through(self):
+        r = self.r
+        r.config("lint: true\n")
+        r.commit_all("config")
+        r.turnstile("install", "--repo")
+
+        self.assertEqual(self.push().returncode, 0)
+
+    def test_install_repo_touches_nothing_global(self):
+        self.r.turnstile("install", "--repo")
+
+        res = subprocess.run(["git", "config", "--global", "--get", "core.hooksPath"],
+                             env=self.r.env, capture_output=True, text=True)
+
+        self.assertEqual(res.stdout.strip(), "")
+
+    def test_install_repo_is_idempotent_and_leaves_a_foreign_hook_alone(self):
+        r = self.r
+        self.assertEqual(r.turnstile("install", "--repo").returncode, 0)
+        self.assertEqual(r.turnstile("install", "--repo").returncode, 0)
+        os.unlink(self.hook)
+        with open(self.hook, "w") as fh:
+            fh.write("#!/bin/sh\necho mine\n")
+
+        res = r.turnstile("install", "--repo")
+
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("turnstile pre-push", res.stderr)
+        with open(self.hook) as fh:
+            self.assertIn("echo mine", fh.read())
+
+    def test_uninstall_repo_removes_only_its_own_hook(self):
+        r = self.r
+        r.turnstile("install", "--repo")
+
+        r.turnstile("uninstall", "--repo")
+
+        self.assertFalse(os.path.exists(self.hook))
+
+    def test_the_hook_says_so_instead_of_blocking_when_turnstile_is_not_installed(self):
+        r = self.r
+        r.config("lint: false\n")
+        r.commit_all("config")
+        r.turnstile("install", "--repo")
+        bare = os.path.join(r.tmp, "bare-bin")
+        os.makedirs(bare)
+        os.symlink(shutil.which("git"), os.path.join(bare, "git"))
+
+        res = subprocess.run(["git", "push", "origin", "HEAD:refs/heads/topic"], cwd=r.root,
+                             env={**r.env, "PATH": bare}, capture_output=True, text=True)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("turnstile is not installed", res.stderr)
+
+    def test_a_hook_manager_can_call_pre_push_with_git_stdin(self):
+        r = self.r
+        r.config("lint: false\n")
+        r.commit_all("config")
+        head = r.git("rev-parse", "HEAD").strip()
+        remote = r.git("rev-parse", "origin/main").strip()
+
+        res = r.turnstile("pre-push", "origin", stdin=f"refs/heads/main {head} refs/heads/main {remote}\n")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("push refused", res.stderr)
+
+    def test_the_global_dispatcher_and_a_repo_hook_do_not_gate_twice(self):
+        r = self.r
+        r.config(f"lint: {r.counted()} && false\n")
+        r.commit_all("config")
+        head = r.git("rev-parse", "HEAD").strip()
+        remote = r.git("rev-parse", "origin/main").strip()
+
+        res = subprocess.run([TURNSTILE, "pre-push", "origin"], cwd=r.root, capture_output=True,
+                             text=True, env={**r.env, "TURNSTILE_IN_pre_push": "1"},
+                             input=f"refs/heads/main {head} refs/heads/main {remote}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 0)
+
+
 class StopHook(unittest.TestCase):
     def stop(self, r: Repo, active: bool = False, env: dict | None = None) -> subprocess.CompletedProcess:
         payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop",

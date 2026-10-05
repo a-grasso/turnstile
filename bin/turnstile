@@ -536,20 +536,74 @@ run_checks() {
 
 # ---------------------------------------------------------------- commands
 
+# Gives the shell's cwd the checks of one pushed ref. Results travel in globals
+# (GATE_*) so the same function serves the in-place run and the worktree run.
+gate_ref() {
+  GATE_FAILURES=0 GATE_UNRUNNABLE=0 GATE_DEGRADED=0 GATE_UNAPPROVED=
+  if ! config_approved; then
+    GATE_UNAPPROVED=1
+    return 0
+  fi
+  TURNSTILE_AI_DEGRADED=0
+  run_checks "$1"
+  GATE_FAILURES=$?
+  GATE_UNRUNNABLE=$TURNSTILE_UNRUNNABLE
+  GATE_DEGRADED=${TURNSTILE_AI_DEGRADED:-0}
+}
+
+PUSH_WORKTREE=""
+
+cleanup_push_worktree() {
+  [ -n "$PUSH_WORKTREE" ] || return 0
+  git worktree remove --force "$PUSH_WORKTREE" >/dev/null 2>&1
+  rm -rf "$PUSH_WORKTREE" "$PUSH_WORKTREE.result"
+  git worktree prune >/dev/null 2>&1
+  PUSH_WORKTREE=""
+}
+
+# The checks run on exactly the commit being pushed, not on whatever the working
+# tree happens to hold. Hooks are off for the checkout: post-checkout would run
+# the repo's own hook in a directory it knows nothing about.
+gate_in_worktree() {
+  local sha="$1" label="$2" git_local_env
+  git_local_env="$(git rev-parse --local-env-vars)"
+  PUSH_WORKTREE="$(mktemp -d "${TMPDIR:-/tmp}/turnstile-push.XXXXXX")" || return 1
+  if ! git -c core.hooksPath=/dev/null worktree add -q --detach "$PUSH_WORKTREE" "$sha" >/dev/null 2>&1; then
+    GATE_FAILURES=1 GATE_UNRUNNABLE=0 GATE_DEGRADED=0 GATE_UNAPPROVED=
+    say "  ${C_RED}✗${C_RESET} could not check out ${sha:0:7} to verify it"
+    cleanup_push_worktree
+    return 0
+  fi
+  # shellcheck disable=SC2086
+  (
+    unset $git_local_env
+    cd "$PUSH_WORKTREE" || exit 70
+    gate_ref "$label"
+    printf 'GATE_FAILURES=%s GATE_UNRUNNABLE=%s GATE_DEGRADED=%s GATE_UNAPPROVED=%s\n' \
+      "$GATE_FAILURES" "$GATE_UNRUNNABLE" "$GATE_DEGRADED" "$GATE_UNAPPROVED" >"$PUSH_WORKTREE.result"
+  )
+  # shellcheck disable=SC1090
+  if [ -f "$PUSH_WORKTREE.result" ]; then . "$PUSH_WORKTREE.result"; else GATE_FAILURES=1; fi
+  cleanup_push_worktree
+}
+
+# The working tree as one hash, untracked files included.
+working_tree() {
+  local snap; snap="$(snapshot_index)" || return 1
+  GIT_INDEX_FILE="$snap" git write-tree
+  rm -f "$snap"
+}
+
 cmd_pre_push() {
   if [ -n "${TURNSTILE_SKIP:-}" ]; then
     warn "turnstile: skipped via TURNSTILE_SKIP"
     return 0
   fi
-  if ! config_approved; then
-    say "$UNAPPROVED_MESSAGE"
-    return 1
-  fi
 
-  local -a ranges=() refs=()
+  local -a ranges=() refs=() shas=()
   local range ref lsha rsha
   while IFS=$'\t' read -r range ref lsha rsha; do
-    ranges+=("$range"); refs+=("$ref")
+    ranges+=("$range"); refs+=("$ref"); shas+=("$lsha")
   done < <(compute_ranges)
 
   if [ "${#ranges[@]}" -eq 0 ]; then
@@ -557,10 +611,13 @@ cmd_pre_push() {
     return 0
   fi
 
+  trap cleanup_push_worktree EXIT INT TERM
+  local root; root="$(repo_root)" || die "not inside a git repository"
+
   # Every pushed ref is gated, in its own pass. Rare enough that the repeated
   # deterministic checks do not matter, and the AI cache means an identical
   # diff across two refs is not paid for twice.
-  local failures=0 i degraded=0 unrunnable=0
+  local failures=0 i degraded=0 unrunnable=0 unapproved=0
   for i in "${!ranges[@]}"; do
     TURNSTILE_MODE=push
     TURNSTILE_RANGE="${ranges[$i]}"
@@ -569,12 +626,31 @@ cmd_pre_push() {
     local label="pre-push → ${1:-remote}"
     [ "${#ranges[@]}" -gt 1 ] && label="$label  [${refs[$i]}]"
 
-    TURNSTILE_AI_DEGRADED=0
-    run_checks "$label"
-    failures=$((failures + $?))
-    degraded=$((degraded + ${TURNSTILE_AI_DEGRADED:-0}))
-    unrunnable=$((unrunnable + TURNSTILE_UNRUNNABLE))
+    local in_place=1
+    if [ ! -f "$root/$CONFIG_NAME" ] && ! git cat-file -e "${shas[$i]}:$CONFIG_NAME" 2>/dev/null; then
+      gate_ref "$label"
+    elif [ "$(cd "$root" && working_tree)" != "$(git rev-parse "${shas[$i]}^{tree}" 2>/dev/null)" ]; then
+      in_place=0
+      label="$label  (${shas[$i]:0:7} in a temporary worktree)"
+      gate_in_worktree "${shas[$i]}" "$label"
+    else
+      gate_ref "$label"
+    fi
+
+    failures=$((failures + GATE_FAILURES))
+    degraded=$((degraded + GATE_DEGRADED))
+    [ -n "$GATE_UNAPPROVED" ] && unapproved=1
+    if [ "$in_place" -eq 0 ] && [ "$GATE_UNRUNNABLE" -gt 0 ]; then
+      warn "turnstile: could not verify ${shas[$i]:0:7}: $GATE_UNRUNNABLE check(s) could not run in a clean checkout of it"
+    else
+      unrunnable=$((unrunnable + GATE_UNRUNNABLE))
+    fi
   done
+
+  if [ "$unapproved" -eq 1 ]; then
+    say "$UNAPPROVED_MESSAGE"
+    return 1
+  fi
 
   if [ "$unrunnable" -gt 0 ] && [ "$failures" -eq 0 ]; then
     warn "turnstile: $unrunnable check(s) could not run - this push was NOT verified by them"
@@ -594,6 +670,17 @@ cmd_pre_push() {
 
   say ""
   return 0
+}
+
+# The entry for hook managers: husky, lefthook or a hand-written hook call it
+# with git's pre-push arguments and stdin. A global dispatcher that already
+# gated this push says so through the environment.
+cmd_pre_push_public() {
+  if [ -n "${TURNSTILE_IN_pre_push:-}" ]; then
+    dim "turnstile: already gated by the global dispatcher"
+    return 0
+  fi
+  cmd_pre_push "$@"
 }
 
 cmd_run() {
@@ -694,9 +781,7 @@ cmd_ci() {
 cmd_tree() {
   local root; root="$(repo_root)" || die "not inside a git repository"
   cd "$root" || exit 1
-  SNAPSHOT="$(snapshot_index)" || die "could not snapshot the working tree"
-  snapshot_tree
-  rm -f "$SNAPSHOT"
+  working_tree || die "could not snapshot the working tree"
 }
 
 cmd_approved() {
@@ -719,7 +804,45 @@ cmd_print_claude_settings() {
   cat "$TURNSTILE_HOME/claude/settings.json"
 }
 
+REPO_HOOK_MARKER='installed by `turnstile install --repo`'
+
+repo_hook_path() {
+  local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || die "not inside a git repository"
+  printf '%s/hooks/pre-push' "$common"
+}
+
+cmd_install_repo() {
+  local hook; hook="$(repo_hook_path)"
+  if [ -e "$hook" ] && ! grep -qF "$REPO_HOOK_MARKER" "$hook"; then
+    die "$hook already exists and is not turnstile's.
+    Call \`turnstile pre-push \"\$@\"\` from it, with git's stdin passed through."
+  fi
+  mkdir -p "$(dirname "$hook")"
+  cat >"$hook" <<HOOK
+#!/bin/sh
+# $REPO_HOOK_MARKER
+command -v turnstile >/dev/null 2>&1 || { echo "turnstile is not installed, so the pre-push checks of this repo did not run. See https://github.com/a-grasso/turnstile#install" >&2; exit 0; }
+exec turnstile pre-push "\$@"
+HOOK
+  chmod +x "$hook"
+  say "  ${C_GREEN}✓${C_RESET} wrote $hook"
+  if [ -n "$(git config --get core.hooksPath || true)" ]; then
+    warn "core.hooksPath is set, so git will not run $hook - call 'turnstile pre-push' from that hook manager instead"
+  fi
+}
+
+cmd_uninstall_repo() {
+  local hook; hook="$(repo_hook_path)"
+  if [ -e "$hook" ] && grep -qF "$REPO_HOOK_MARKER" "$hook"; then
+    rm -f "$hook"
+    say "  ${C_GREEN}✓${C_RESET} removed $hook"
+  else
+    warn "$hook is not turnstile's - leaving it alone"
+  fi
+}
+
 cmd_install() {
+  if [ "${1:-}" = "--repo" ]; then cmd_install_repo; return; fi
   local dispatch="$TURNSTILE_HOME/hooks/dispatch"
   [ -x "$dispatch" ] || die "missing or non-executable: $dispatch"
 
@@ -757,6 +880,7 @@ cmd_install() {
 }
 
 cmd_uninstall() {
+  if [ "${1:-}" = "--repo" ]; then cmd_uninstall_repo; return; fi
   local current
   current="$(git config --global --get core.hooksPath || true)"
   if [ "$current" = "$HOOKS_INSTALL_DIR" ]; then
@@ -914,7 +1038,10 @@ usage() {
 
   ${C_BOLD}Usage${C_RESET}
     turnstile install      install the global hook dispatcher
-    turnstile uninstall    remove it
+    turnstile install --repo
+                           write only this repo's .git/hooks/pre-push
+    turnstile uninstall    remove it (--repo: this repo's hook)
+    turnstile pre-push     the gate, for a hook manager to call with git's pre-push stdin
     turnstile allow        approve this repo's current .turnstile; runs refuse an unapproved one
     turnstile status       show gate + this repo's checks
     turnstile run          run this repo's checks on the working tree, without pushing
@@ -945,11 +1072,12 @@ EOF
 
 case "${1:-}" in
   __pre-push)  shift; cmd_pre_push "$@" ;;
+  pre-push)    shift; cmd_pre_push_public "$@" ;;
   __tree)      cmd_tree ;;
   __approved)  cmd_approved ;;
   allow)       cmd_allow ;;
-  install)     cmd_install ;;
-  uninstall)   cmd_uninstall ;;
+  install)     shift; cmd_install "$@" ;;
+  uninstall)   shift; cmd_uninstall "$@" ;;
   status)      cmd_status ;;
   run)         shift; cmd_run "$@" ;;
   ci)          shift; cmd_ci "$@" ;;
