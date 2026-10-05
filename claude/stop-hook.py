@@ -13,11 +13,13 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 TURNSTILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin", "turnstile"
 )
 MAX_REASON_CHARS = 6000
+SLOW_NOTICE_SECONDS = float(os.environ.get("TURNSTILE_SLOW_NOTICE") or 10)
 
 REASON = """turnstile: this repo's checks fail on the working tree, so the work is not done.
 
@@ -29,10 +31,11 @@ and the ones that already passed on this tree are not rerun. `turnstile run
 instead of working around it."""
 
 
-def emit(decision: dict) -> None:
-    notice = os.environ.get("TURNSTILE_NOTICE")
-    if notice:
-        decision["systemMessage"] = "\n".join(filter(None, [notice, decision.get("systemMessage")]))
+def emit(decision: dict, notices: list[str]) -> None:
+    messages = [*filter(None, [os.environ.get("TURNSTILE_NOTICE")]), *notices,
+                *filter(None, [decision.get("systemMessage")])]
+    if messages:
+        decision["systemMessage"] = "\n".join(messages)
     if decision:
         print(json.dumps(decision))
 
@@ -60,9 +63,15 @@ def main() -> int:
     if not root or not os.path.isfile(os.path.join(root, ".turnstile")):
         return 0
 
+    notices: list[str] = []
     env = {**os.environ, "NO_COLOR": "1"}
+    started = time.monotonic()
     run = subprocess.run([TURNSTILE, "run", "--stop"], cwd=root, env=env,
                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    elapsed = time.monotonic() - started
+    if elapsed >= SLOW_NOTICE_SECONDS:
+        notices.append(f"turnstile: the checks took {elapsed:.0f}s (not cached); "
+                       "later stops reuse what passed on an unchanged tree")
     state = state_path(str(payload.get("session_id") or ""))
 
     if run.returncode == 0:
@@ -70,7 +79,7 @@ def main() -> int:
             os.unlink(state)
         except OSError:
             pass
-        emit({})
+        emit({}, notices)
         return 0
 
     tree = subprocess.run([TURNSTILE, "__tree"], cwd=root, env=env, capture_output=True,
@@ -83,7 +92,7 @@ def main() -> int:
 
     if payload.get("stop_hook_active") and tree and tree == last_refused:
         emit({"systemMessage": "turnstile: checks still fail and nothing changed since the "
-                               "last attempt, so the agent stopped. Run `turnstile run`."})
+                               "last attempt, so the agent stopped. Run `turnstile run`."}, notices)
         return 0
 
     with open(state, "w", encoding="utf-8") as fh:
@@ -92,7 +101,7 @@ def main() -> int:
     report = (run.stderr + run.stdout).strip()
     if len(report) > MAX_REASON_CHARS:
         report = "...\n" + report[-MAX_REASON_CHARS:]
-    emit({"decision": "block", "reason": REASON.format(report=report)})
+    emit({"decision": "block", "reason": REASON.format(report=report)}, notices)
     return 0
 
 

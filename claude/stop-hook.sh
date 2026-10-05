@@ -30,6 +30,7 @@ if [ ! -f "$profile" ]; then
   if (cd "$root" && "$nix" print-dev-env --no-write-lock-file >"$building" 2>"$building.err" </dev/null); then
     rm -f "$cache"/devenv-*.sh
     mv "$building" "$profile"
+    TURNSTILE_NOTICE="turnstile: built the dev environment (first run, cached for later stops)"
   else
     reason=$(grep . "$building.err" | tail -n 1)
     TURNSTILE_NOTICE="turnstile: could not build the dev environment ($reason), so the checks ran without it"

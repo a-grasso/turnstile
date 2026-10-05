@@ -91,7 +91,7 @@ only when the change touches a file its globs match; see
 For the agent-side half, commit a Claude Code `Stop` hook to the project's
 `.claude/settings.json`, so contributors install nothing for it.
 `turnstile print-claude-settings` prints the block, which is
-[claude/settings.json](claude/settings.json)<!--@2eaf8487-->:
+[claude/settings.json](claude/settings.json)<!--@049f7c8c-->:
 
 ```json
 {
@@ -102,7 +102,8 @@ For the agent-side half, commit a Claude Code `Stop` hook to the project's
           {
             "type": "command",
             "command": "cd \"${CLAUDE_PROJECT_DIR:-.}\" || exit 0; command -v turnstile >/dev/null && exec turnstile hook claude-stop; if [ -f flake.nix ]; then for n in nix /nix/var/nix/profiles/default/bin/nix; do command -v $n >/dev/null && exec $n develop -c turnstile hook claude-stop; done; fi; echo '{\"systemMessage\": \"turnstile is not installed, so the checks of this repo did not run at agent stop. See https://github.com/a-grasso/turnstile#install\"}'",
-            "timeout": 900
+            "timeout": 900,
+            "statusMessage": "turnstile: running checks (a first run builds the dev environment)"
           }
         ]
       }
@@ -116,7 +117,7 @@ The command runs in the project directory and picks the first of three:
 1. `turnstile hook claude-stop`, when `turnstile` is on PATH. In a project with
    a `flake.nix`, outside its dev shell (neither `IN_NIX_SHELL` nor
    `DIRENV_DIR` set), the hook runs the checks in the project's toolchain
-   ([claude/stop-hook.sh](claude/stop-hook.sh)<!--@6bb86867-->): it caches
+   ([claude/stop-hook.sh](claude/stop-hook.sh)<!--@201741b3-->): it caches
    `nix print-dev-env` under `.git/turnstile/`, keyed on the hash of
    `flake.nix` and `flake.lock`, and sources it. That costs one evaluation per
    change to those two files instead of the 25 to 44s `nix develop` takes on
@@ -134,6 +135,12 @@ The third is fail-open but visible, on purpose: a teammate who has not adopted
 turnstile is never blocked, and sees that the checks did not run. The fallback
 lives in the settings command and not in turnstile because it has to work when
 turnstile is absent. Repos without a `.turnstile` are left alone either way.
+
+Claude Code shows a hook's output only once it has finished, so a slow stop is
+explained twice: the spinner reads the block's `statusMessage` while the hook
+runs, and a `systemMessage` afterwards says what was slow, either that the dev
+environment was built or that the checks took ten seconds or more uncached
+(`TURNSTILE_SLOW_NOTICE` sets that threshold, in seconds).
 
 Undo everything with `turnstile uninstall`.
 
@@ -234,7 +241,7 @@ agent writes code
 
 The pre-push gate alone catches a failing check after the session that caused
 it has moved on. `turnstile hook claude-stop`
-([claude/stop-hook.py](claude/stop-hook.py)<!--@190a619e-->) reads Claude Code's Stop
+([claude/stop-hook.py](claude/stop-hook.py)<!--@e9e4985a-->) reads Claude Code's Stop
 payload, runs the deterministic checks that are not push-only whenever the
 agent ends a turn and, on failure, blocks the stop with the report, so the
 agent fixes it while it still has the context.

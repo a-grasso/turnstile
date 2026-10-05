@@ -541,11 +541,12 @@ class DeltaReview(unittest.TestCase):
 
 
 class StopHook(unittest.TestCase):
-    def stop(self, r: Repo, active: bool = False) -> subprocess.CompletedProcess:
+    def stop(self, r: Repo, active: bool = False, env: dict | None = None) -> subprocess.CompletedProcess:
         payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop",
                    "stop_hook_active": active}
         return subprocess.run([TURNSTILE, "hook", "claude-stop"], input=json.dumps(payload),
-                              env=r.env, capture_output=True, text=True, cwd=r.root)
+                              env={**r.env, **(env or {})}, capture_output=True, text=True,
+                              cwd=r.root)
 
     def test_repo_without_turnstile_config_is_left_alone(self):
         r = Repo(self)
@@ -619,6 +620,24 @@ class StopHook(unittest.TestCase):
         res = r.turnstile("hook", "claude-stop", stdin="not json")
 
         self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.strip(), "")
+
+    def test_a_slow_uncached_run_says_why_the_stop_took_long(self):
+        r = Repo(self)
+        r.config("slow: sleep 1.2\n")
+
+        res = self.stop(r, env={"TURNSTILE_SLOW_NOTICE": "1"})
+
+        message = json.loads(res.stdout)["systemMessage"]
+        self.assertIn("checks took", message)
+        self.assertIn("later stops reuse", message)
+
+    def test_a_fast_run_stays_silent(self):
+        r = Repo(self)
+        r.config("fast: true\n")
+
+        res = self.stop(r, env={"TURNSTILE_SLOW_NOTICE": "30"})
+
         self.assertEqual(res.stdout.strip(), "")
 
     def test_unknown_hook_is_refused(self):
@@ -760,6 +779,22 @@ class StopInDevEnvironment(unittest.TestCase):
         self.assertTrue(os.path.exists(bash_log))
         self.assertEqual(self.probed(), "from-devenv")
 
+    def test_building_the_environment_is_announced_once(self):
+        first = self.stop()
+        self.r.write("a.txt", "edited\n")
+        second = self.stop()
+
+        self.assertIn("built the dev environment (first run", json.loads(first.stdout)["systemMessage"])
+        self.assertEqual(second.stdout.strip(), "")
+
+    def test_the_announcement_rides_along_with_a_block(self):
+        self.r.config("unit: false\n")
+
+        out = json.loads(self.stop().stdout)
+
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("built the dev environment", out["systemMessage"])
+
     def test_a_red_check_still_blocks_with_the_payload_read_through_the_environment(self):
         self.r.config("unit: false\n")
 
@@ -799,6 +834,12 @@ class ClaudeSettingsBlock(unittest.TestCase):
     def test_readme_shows_the_committed_block(self):
         with open(SETTINGS) as fh, open(os.path.join(HOME, "README.md")) as readme:
             self.assertIn(fh.read(), readme.read())
+
+    def test_the_spinner_says_what_a_slow_first_run_is_doing(self):
+        with open(SETTINGS) as fh:
+            hook = json.load(fh)["hooks"]["Stop"][0]["hooks"][0]
+
+        self.assertIn("dev environment", hook["statusMessage"])
 
     def test_installed_turnstile_is_used_first(self):
         self.fake("turnstile")
