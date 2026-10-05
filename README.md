@@ -105,6 +105,32 @@ installed turnstile is never affected.
 
 Undo everything with `turnstile uninstall`.
 
+## Install with Nix
+
+Pin it per project with a flake input, and the version lives in `flake.lock`:
+
+```nix
+{
+  inputs.turnstile.url = "github:a-grasso/turnstile";
+  inputs.turnstile.inputs.nixpkgs.follows = "nixpkgs";
+
+  outputs = { nixpkgs, turnstile, ... }: let
+    system = "aarch64-darwin";
+    pkgs = nixpkgs.legacyPackages.${system};
+  in {
+    devShells.${system}.default = pkgs.mkShell {
+      packages = [ turnstile.packages.${system}.default ];
+    };
+  };
+}
+```
+
+Or run it once: `nix run github:a-grasso/turnstile -- doctor`.
+
+The package puts `turnstile` and `turnstile-ai` on PATH with `bash`, `git`,
+`python3` and the coreutils they need. `turnstile install` still writes the
+global `core.hooksPath`, pointing at the store path of the pinned version.
+
 ## Commands
 
 ```

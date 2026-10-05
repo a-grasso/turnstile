@@ -5,3 +5,4 @@ __pycache__/
 # under Turnstile/ is source.
 /.vale/styles/*
 !/.vale/styles/Turnstile/
+/result
