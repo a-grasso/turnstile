@@ -1,16 +1,18 @@
 """End-to-end tests: real temp repos, the real scripts, a fake `claude` on PATH."""
 
+import concurrent.futures
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
 HOME = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TURNSTILE = os.path.join(HOME, "bin", "turnstile")
-STOP_HOOK = os.path.join(HOME, "claude", "verify-on-stop.py")
+SETTINGS = os.path.join(HOME, "claude", "settings.json")
 
 FAKE_CLAUDE = """#!/usr/bin/env python3
 import json, os, sys, time
@@ -39,12 +41,9 @@ class Repo:
         self.claude_log = os.path.join(self.tmp, "claude-log")
         self.block_flag = os.path.join(self.tmp, "block-flag")
 
-        fakebin = os.path.join(self.tmp, "bin")
+        self.fakebin = fakebin = os.path.join(self.tmp, "bin")
         os.makedirs(fakebin)
-        claude = os.path.join(fakebin, "claude")
-        with open(claude, "w") as fh:
-            fh.write(FAKE_CLAUDE)
-        os.chmod(claude, 0o755)
+        self.fake("claude", FAKE_CLAUDE)
 
         gitconfig = os.path.join(self.tmp, "gitconfig")
         with open(gitconfig, "w") as fh:
@@ -54,7 +53,8 @@ class Repo:
         # GIT_DIR and friends point at the real repo, and every git call below
         # would land there.
         inherited = {k: v for k, v in os.environ.items()
-                     if not k.startswith(("GIT_", "TURNSTILE_"))}
+                     if not k.startswith(("GIT_", "TURNSTILE_"))
+                     and k not in ("IN_NIX_SHELL", "DIRENV_DIR")}
         self.env = {
             **inherited,
             "PATH": f"{fakebin}:{os.environ['PATH']}",
@@ -63,6 +63,7 @@ class Repo:
             "TURNSTILE_CACHE": os.path.join(self.tmp, "cache-ai"),
             "TURNSTILE_CHECK_CACHE": os.path.join(self.tmp, "cache-checks"),
             "TURNSTILE_STATE": os.path.join(self.tmp, "state"),
+            "TURNSTILE_ALLOWED": os.path.join(self.tmp, "allowed"),
             "FAKE_CLAUDE_LOG": self.claude_log,
             "FAKE_CLAUDE_BLOCK_FLAG": self.block_flag,
             "NO_COLOR": "1",
@@ -77,14 +78,22 @@ class Repo:
         self.git("remote", "add", "origin", self.remote)
         self.git("push", "-q", "-u", "origin", "main", "--no-verify")
 
+    def fake(self, name: str, script: str) -> None:
+        path = os.path.join(self.fakebin, name)
+        with open(path, "w") as fh:
+            fh.write(script)
+        os.chmod(path, 0o755)
+
     def write(self, rel: str, content: str) -> None:
         path = os.path.join(self.root, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as fh:
             fh.write(content)
 
-    def config(self, text: str) -> None:
+    def config(self, text: str, allow: bool = True) -> None:
         self.write(".turnstile", textwrap.dedent(text))
+        if allow:
+            self.turnstile("allow")
 
     def git(self, *args: str) -> str:
         return subprocess.run(["git", *args], cwd=self.root, env=self.env, check=True,
@@ -354,6 +363,69 @@ class TreeMutation(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
 
 
+class Parallel(unittest.TestCase):
+    def test_checks_run_concurrently(self):
+        r = Repo(self)
+        a, b = os.path.join(r.tmp, "a-started"), os.path.join(r.tmp, "b-started")
+        wait_for = "for i in $(seq 50); do [ -f {} ] && exit 0; sleep 0.1; done; exit 1"
+        r.config(f"a: touch {a}; {wait_for.format(b)}\n"
+                 f"b: touch {b}; {wait_for.format(a)}\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_results_are_reported_in_config_order(self):
+        r = Repo(self)
+        r.config("slow: sleep 1\nfast: true\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertLess(res.stderr.index("slow"), res.stderr.index("fast"))
+
+
+class PushOnly(unittest.TestCase):
+    def test_stop_mode_skips_a_push_only_check_and_says_so(self):
+        r = Repo(self)
+        r.config(f"push e2e: {r.counted()}\n")
+
+        res = r.turnstile("run", "--stop")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 0)
+        self.assertIn("e2e (at push)", res.stderr)
+
+    def test_a_full_run_includes_push_only_checks(self):
+        r = Repo(self)
+        r.config(f"push e2e: {r.counted()}\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 1)
+
+    def test_push_only_check_keeps_its_scope(self):
+        r = Repo(self)
+        r.config(f"push e2e [lib/**]: {r.counted()}\n")
+        r.write("a.txt", "changed\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(r.runs(), 0)
+        self.assertIn("e2e (not touched)", res.stderr)
+
+    def test_stop_mode_never_calls_the_model(self):
+        r = Repo(self)
+        r.write(".turnstile.d/modules/m.md", "---\nname: m\n---\nReview it.\n")
+        r.config("unit: true\nai m: block=high\n")
+        r.write("a.txt", "x\n")
+        r.commit_all()
+
+        r.turnstile("run", "--stop")
+
+        self.assertEqual(r.prompts(), [])
+
+
 class Intent(unittest.TestCase):
     def test_intent_line_is_not_executed_as_a_check(self):
         r = Repo(self)
@@ -471,12 +543,580 @@ class DeltaReview(unittest.TestCase):
         self.assertEqual(len(self.r.prompts()), calls)
 
 
+class CannotRunHere(unittest.TestCase):
+    def test_exit_77_is_reported_with_the_last_line_and_is_not_a_failure(self):
+        r = Repo(self)
+        r.config("e2e: echo noise; echo 'docker is not running'; exit 77\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("? e2e (could not run: docker is not running)", res.stderr)
+        self.assertNotIn("check(s) failed", res.stderr)
+
+    def test_the_summary_counts_the_checks_that_could_not_run(self):
+        r = Repo(self)
+        r.config("a: exit 77\nb: exit 77\nc: true\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertIn("all checks passed (2 check(s) could not run)", res.stderr)
+
+    def test_a_check_that_could_not_run_is_never_cached(self):
+        r = Repo(self)
+        r.config(f"e2e: {r.counted()}; exit 77\n")
+
+        r.turnstile("run", "--no-ai")
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(r.runs(), 2)
+        self.assertNotIn("cached", res.stderr)
+
+    def test_it_does_not_hide_a_real_failure_beside_it(self):
+        r = Repo(self)
+        r.config("e2e: exit 77\nlint: exit 1\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("1 check(s) failed", res.stderr)
+
+    def test_a_push_goes_through_but_says_it_was_not_fully_verified(self):
+        r = Repo(self)
+        r.config("e2e: exit 77\n")
+        r.commit_all("config")
+
+        res = r.pre_push()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("1 check(s) could not run", res.stderr)
+
+    def test_the_stop_hook_lets_the_agent_stop_and_says_what_did_not_run(self):
+        r = Repo(self)
+        r.config("e2e: echo no docker; exit 77\n")
+        payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop"}
+
+        res = subprocess.run([TURNSTILE, "hook", "claude-stop"], input=json.dumps(payload),
+                             env=r.env, capture_output=True, text=True, cwd=r.root)
+
+        out = json.loads(res.stdout)
+        self.assertNotIn("decision", out)
+        self.assertIn("1 check(s) could not run", out["systemMessage"])
+        self.assertIn("e2e (could not run: no docker)", out["systemMessage"])
+
+
+class Ci(unittest.TestCase):
+    def pull_request(self, base_config: str, pr_config: str | None = None) -> Repo:
+        r = Repo(self)
+        r.config(base_config.replace("{counted}", r.counted()))
+        r.commit_all("gate")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "-c", "pr")
+        if pr_config is not None:
+            r.config(pr_config.replace("{counted}", r.counted()))
+        r.write("lib/change.txt", "the change\n")
+        r.commit_all("the pr")
+        return r
+
+    def test_a_pr_that_deletes_a_check_still_gets_it_run(self):
+        r = self.pull_request("lint: {counted}\n", "# no checks left\n")
+
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 1)
+
+    def test_a_pr_cannot_turn_a_failing_check_green(self):
+        r = self.pull_request("lint: false\n", "lint: true\n")
+
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("lint", res.stderr)
+
+    def test_a_check_the_pr_adds_is_not_run(self):
+        r = Repo(self)
+        r.config("lint: true\n")
+        r.commit_all("gate")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "-c", "pr")
+        r.config(f"lint: true\nextra: {r.counted()}\n")
+        r.commit_all("the pr")
+
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 0)
+
+    def test_checks_see_exactly_the_files_of_base_to_head(self):
+        r = Repo(self)
+        seen = os.path.join(r.tmp, "seen")
+        r.config(f'probe: printf "%s" "$TURNSTILE_CHANGED_FILES" > {seen}\n')
+        r.commit_all("gate")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "-c", "pr")
+        r.write("lib/change.txt", "the change\n")
+        r.commit_all("the pr")
+        r.write("uncommitted.txt", "not part of the pr\n")
+
+        r.turnstile("ci", "--base", "main")
+
+        with open(seen) as fh:
+            self.assertEqual(fh.read().split(), ["lib/change.txt"])
+
+    def test_ci_never_reads_or_writes_the_pass_cache(self):
+        r = Repo(self)
+        r.config(f"lint: {r.counted()}\n")
+        r.commit_all("gate")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "-c", "pr")
+        r.write("lib/change.txt", "x\n")
+        r.commit_all("the pr")
+        r.turnstile("run", "--no-ai")
+
+        r.turnstile("ci", "--base", "main")
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(r.runs(), 3)
+        self.assertNotIn("cached", res.stderr)
+
+    def test_ci_never_calls_the_model(self):
+        r = self.pull_request("ai review: block=high\nlint: true\n")
+
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.prompts(), [])
+        self.assertIn("ai modules do not run in ci", res.stderr)
+
+    def test_a_base_without_a_config_has_nothing_to_run(self):
+        r = Repo(self)
+        r.git("switch", "-q", "-c", "pr")
+        r.config(f"lint: {r.counted()}\n")
+        r.commit_all("adds the gate")
+
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 0)
+        self.assertIn("no .turnstile at main", res.stderr)
+
+    def test_ci_requires_a_resolvable_base(self):
+        r = Repo(self)
+
+        self.assertNotEqual(r.turnstile("ci").returncode, 0)
+        self.assertNotEqual(r.turnstile("ci", "--base", "no-such-ref").returncode, 0)
+
+
+class CiAction(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(HOME, "action.yml")) as fh:
+            self.action = fh.read()
+
+    def test_it_installs_nix_and_runs_ci_against_the_pull_requests_base(self):
+        self.assertIn("cachix/install-nix-action", self.action)
+        self.assertIn("github.event.pull_request.base.sha", self.action)
+        self.assertIn('ci --base "$BASE"', self.action)
+
+    def test_it_runs_inside_the_projects_dev_shell_when_there_is_a_flake(self):
+        self.assertIn("[ -f flake.nix ]", self.action)
+        self.assertIn('nix develop --no-write-lock-file -c "$turnstile" ci', self.action)
+
+    def test_the_readme_shows_how_to_use_it(self):
+        with open(os.path.join(HOME, "README.md")) as fh:
+            readme = fh.read()
+        self.assertIn("- uses: a-grasso/turnstile@main", readme)
+        self.assertIn("fetch-depth: 0", readme)
+
+
+UNAPPROVED = "turnstile: .turnstile changed since you approved it, run `turnstile allow` after reviewing it"
+
+
+class Allow(unittest.TestCase):
+    def unapproved(self) -> Repo:
+        r = Repo(self)
+        r.config(f"lint: {r.counted()}\n", allow=False)
+        return r
+
+    def test_an_unapproved_config_is_not_executed(self):
+        r = self.unapproved()
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn(UNAPPROVED, res.stderr)
+        self.assertEqual(r.runs(), 0)
+
+    def test_allow_approves_the_current_content(self):
+        r = self.unapproved()
+
+        allowed = r.turnstile("allow")
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 1)
+
+    def test_editing_the_config_withdraws_the_approval(self):
+        r = self.unapproved()
+        r.turnstile("allow")
+        r.write(".turnstile", f"lint: {r.counted()} && true\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn(UNAPPROVED, res.stderr)
+        self.assertEqual(r.runs(), 0)
+
+    def test_an_approval_does_not_carry_over_to_another_clone(self):
+        r = self.unapproved()
+        r.turnstile("allow")
+        r.commit_all("config")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        clone = os.path.join(r.tmp, "clone")
+        subprocess.run(["git", "clone", "-q", r.remote, clone], env=r.env, check=True)
+
+        res = subprocess.run([TURNSTILE, "run", "--no-ai"], cwd=clone, env=r.env,
+                             capture_output=True, text=True)
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn(UNAPPROVED, res.stderr)
+
+    def test_a_push_with_an_unapproved_config_is_refused(self):
+        r = self.unapproved()
+        r.commit_all("config")
+
+        refused = r.pre_push()
+        r.turnstile("allow")
+        allowed = r.pre_push()
+
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn(UNAPPROVED, refused.stderr)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(r.runs(), 1)
+
+    def test_ci_reads_the_base_branch_and_needs_no_approval(self):
+        r = self.unapproved()
+        r.commit_all("config")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "-c", "pr")
+        r.write("lib/change.txt", "x\n")
+        r.commit_all("the pr")
+
+        res = r.turnstile("ci", "--base", "main")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 1)
+
+    def test_the_stop_hook_says_so_without_blocking_or_running_anything(self):
+        r = self.unapproved()
+        payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop"}
+
+        res = subprocess.run([TURNSTILE, "hook", "claude-stop"], input=json.dumps(payload),
+                             env=r.env, capture_output=True, text=True, cwd=r.root)
+
+        out = json.loads(res.stdout)
+        self.assertNotIn("decision", out)
+        self.assertEqual(out["systemMessage"], UNAPPROVED)
+        self.assertEqual(r.runs(), 0)
+
+    def test_status_shows_whether_the_config_is_approved(self):
+        r = self.unapproved()
+
+        before = r.turnstile("status").stderr
+        r.turnstile("allow")
+        after = r.turnstile("status").stderr
+
+        self.assertIn("not approved", before)
+        self.assertNotIn("not approved", after)
+        self.assertIn("approved", after)
+
+    def test_allow_without_a_config_says_there_is_nothing_to_approve(self):
+        r = Repo(self)
+
+        res = r.turnstile("allow")
+
+        self.assertNotEqual(res.returncode, 0)
+
+
+class PushedCommits(unittest.TestCase):
+    def push_of(self, r: Repo, ref: str, sha: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        remote = r.git("rev-parse", "origin/main").strip()
+        zero = "0" * 40
+        known = r.git("ls-remote", "origin", ref).split()
+        return subprocess.run([TURNSTILE, "__pre-push", "origin"], cwd=r.root,
+                              env={**r.env, **(env or {})}, capture_output=True, text=True,
+                              input=f"{ref} {sha} {ref} {known[0] if known else zero}\n")
+
+    def head(self, r: Repo) -> str:
+        return r.git("rev-parse", "HEAD").strip()
+
+    def test_a_dirty_tree_does_not_stand_in_for_the_commits_being_pushed(self):
+        r = Repo(self)
+        r.config("clean: test ! -e junk.txt\n")
+        r.commit_all("config")
+        r.write("junk.txt", "untracked, not part of the push\n")
+
+        res = self.push_of(r, "refs/heads/main", self.head(r))
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("temporary worktree", res.stderr)
+
+    def test_uncommitted_edits_do_not_hide_a_bad_commit(self):
+        r = Repo(self)
+        r.config("content: grep -q good a.txt\n")
+        r.write("a.txt", "bad\n")
+        r.commit_all("bad commit")
+        r.write("a.txt", "good\n")
+
+        res = self.push_of(r, "refs/heads/main", self.head(r))
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+
+    def test_a_branch_that_is_not_checked_out_is_checked_as_pushed(self):
+        r = Repo(self)
+        r.config("content: grep -q good a.txt\n")
+        r.commit_all("config")
+        r.git("switch", "-q", "-c", "feature")
+        r.write("a.txt", "bad\n")
+        r.commit_all("bad on feature")
+        feature = self.head(r)
+        r.git("switch", "-q", "main")
+        r.write("a.txt", "good\n")
+        r.commit_all("good on main")
+
+        res = self.push_of(r, "refs/heads/feature", feature)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+
+    def test_a_clean_tree_that_matches_the_push_runs_in_place(self):
+        r = Repo(self)
+        where = os.path.join(r.tmp, "where")
+        r.config(f'where: pwd -P > {where}\n')
+        r.commit_all("config")
+
+        res = self.push_of(r, "refs/heads/main", self.head(r))
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("temporary worktree", res.stderr)
+        with open(where) as fh:
+            self.assertEqual(fh.read().strip(), os.path.realpath(r.root))
+
+    def test_the_temporary_worktree_is_removed_afterwards(self):
+        r = Repo(self)
+        where = os.path.join(r.tmp, "where")
+        r.config(f'where: pwd -P > {where}\n')
+        r.commit_all("config")
+        r.write("junk.txt", "dirty\n")
+
+        self.push_of(r, "refs/heads/main", self.head(r))
+
+        with open(where) as fh:
+            checked_out_at = fh.read().strip()
+        self.assertNotEqual(checked_out_at, os.path.realpath(r.root))
+        self.assertFalse(os.path.exists(checked_out_at))
+        self.assertEqual(len(r.git("worktree", "list").strip().splitlines()), 1)
+
+    def test_checks_that_cannot_run_in_the_checkout_are_not_red(self):
+        r = Repo(self)
+        r.config("e2e: echo 'node_modules missing'; exit 77\n")
+        r.commit_all("config")
+        r.write("junk.txt", "dirty\n")
+        sha = self.head(r)
+
+        res = self.push_of(r, "refs/heads/main", sha)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"could not verify {sha[:7]}", res.stderr)
+
+    def test_it_works_with_the_git_environment_a_hook_inherits(self):
+        r = Repo(self)
+        r.config("clean: test ! -e junk.txt\n")
+        r.commit_all("config")
+        r.write("junk.txt", "dirty\n")
+
+        res = self.push_of(r, "refs/heads/main", self.head(r),
+                           env={"GIT_DIR": os.path.join(r.root, ".git")})
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_the_pass_cache_is_shared_between_the_checkout_and_the_tree(self):
+        r = Repo(self)
+        r.config(f"lint: {r.counted()}\n")
+        r.commit_all("config")
+        r.write("junk.txt", "dirty\n")
+        self.push_of(r, "refs/heads/main", self.head(r))
+        r.git("clean", "-fdq")
+
+        res = self.push_of(r, "refs/heads/main", self.head(r))
+
+        self.assertEqual(r.runs(), 1)
+        self.assertIn("cached", res.stderr)
+
+
+class RepoHook(unittest.TestCase):
+    def setUp(self):
+        r = self.r = Repo(self)
+        os.symlink(TURNSTILE, os.path.join(r.fakebin, "turnstile"))
+        self.hook = os.path.join(r.root, ".git", "hooks", "pre-push")
+
+    def push(self, *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "push", *extra, "origin", "HEAD:refs/heads/topic"],
+                              cwd=self.r.root, env=self.r.env, capture_output=True, text=True)
+
+    def test_install_repo_writes_a_pre_push_hook_that_gates_a_real_push(self):
+        r = self.r
+        r.config("lint: false\n")
+        r.commit_all("config")
+
+        installed = r.turnstile("install", "--repo")
+        refused = self.push()
+        bypassed = self.push("--no-verify")
+
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertTrue(os.access(self.hook, os.X_OK))
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("push refused", refused.stderr)
+        self.assertEqual(bypassed.returncode, 0, bypassed.stderr)
+
+    def test_a_passing_push_goes_through(self):
+        r = self.r
+        r.config("lint: true\n")
+        r.commit_all("config")
+        r.turnstile("install", "--repo")
+
+        self.assertEqual(self.push().returncode, 0)
+
+    def test_install_repo_touches_nothing_global(self):
+        self.r.turnstile("install", "--repo")
+
+        res = subprocess.run(["git", "config", "--global", "--get", "core.hooksPath"],
+                             env=self.r.env, capture_output=True, text=True)
+
+        self.assertEqual(res.stdout.strip(), "")
+
+    def test_install_repo_is_idempotent_and_leaves_a_foreign_hook_alone(self):
+        r = self.r
+        self.assertEqual(r.turnstile("install", "--repo").returncode, 0)
+        self.assertEqual(r.turnstile("install", "--repo").returncode, 0)
+        os.unlink(self.hook)
+        with open(self.hook, "w") as fh:
+            fh.write("#!/bin/sh\necho mine\n")
+
+        res = r.turnstile("install", "--repo")
+
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("turnstile pre-push", res.stderr)
+        with open(self.hook) as fh:
+            self.assertIn("echo mine", fh.read())
+
+    def test_uninstall_repo_removes_only_its_own_hook(self):
+        r = self.r
+        r.turnstile("install", "--repo")
+
+        r.turnstile("uninstall", "--repo")
+
+        self.assertFalse(os.path.exists(self.hook))
+
+    def test_the_hook_says_so_instead_of_blocking_when_turnstile_is_not_installed(self):
+        r = self.r
+        r.config("lint: false\n")
+        r.commit_all("config")
+        r.turnstile("install", "--repo")
+        bare = os.path.join(r.tmp, "bare-bin")
+        os.makedirs(bare)
+        os.symlink(shutil.which("git"), os.path.join(bare, "git"))
+
+        res = subprocess.run(["git", "push", "origin", "HEAD:refs/heads/topic"], cwd=r.root,
+                             env={**r.env, "PATH": bare}, capture_output=True, text=True)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("turnstile is not installed", res.stderr)
+
+    def test_a_hook_manager_can_call_pre_push_with_git_stdin(self):
+        r = self.r
+        r.config("lint: false\n")
+        r.commit_all("config")
+        head = r.git("rev-parse", "HEAD").strip()
+        remote = r.git("rev-parse", "origin/main").strip()
+
+        res = r.turnstile("pre-push", "origin", stdin=f"refs/heads/main {head} refs/heads/main {remote}\n")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("push refused", res.stderr)
+
+    def test_the_global_dispatcher_and_a_repo_hook_do_not_gate_twice(self):
+        r = self.r
+        r.config(f"lint: {r.counted()} && false\n")
+        r.commit_all("config")
+        head = r.git("rev-parse", "HEAD").strip()
+        remote = r.git("rev-parse", "origin/main").strip()
+
+        res = subprocess.run([TURNSTILE, "pre-push", "origin"], cwd=r.root, capture_output=True,
+                             text=True, env={**r.env, "TURNSTILE_IN_pre_push": "1"},
+                             input=f"refs/heads/main {head} refs/heads/main {remote}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(r.runs(), 0)
+
+
+class FailureSummary(unittest.TestCase):
+    CONFIG = """
+        lint: echo 'src/a.go:3: undefined: x'; echo 'make: *** [lint] Error 1'; exit 2
+        ok: true
+        unit: echo 'FAIL TestWidget'; exit 1
+        e2e: echo 'no docker'; exit 77
+    """
+
+    def test_run_opens_its_failure_report_with_one_line_per_failing_check(self):
+        r = Repo(self)
+        r.config(self.CONFIG)
+
+        res = r.turnstile("run", "--no-ai")
+
+        lines = res.stderr.splitlines()
+        first_detail = next(i for i, line in enumerate(lines) if line.strip().startswith("$ "))
+        head = "\n".join(lines[:first_detail])
+        self.assertIn("lint: exit 2, src/a.go:3: undefined: x", head)
+        self.assertIn("unit: exit 1, FAIL TestWidget", head)
+        self.assertNotIn("e2e: exit", res.stderr)
+        self.assertNotIn("ok: exit", res.stderr)
+
+    def test_a_green_run_has_no_failure_report(self):
+        r = Repo(self)
+        r.config("ok: true\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertNotIn("failing", res.stderr)
+
+    def test_a_check_that_rewrites_the_tree_is_named_in_the_summary(self):
+        r = Repo(self)
+        r.config("fmt: echo formatted > lib/b.txt\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertIn("tree: modified while fmt ran", res.stderr.split("$ ")[0])
+
+    def test_the_stop_hook_reason_starts_with_the_summary_even_when_the_report_is_cut(self):
+        r = Repo(self)
+        r.config("lint: seq 1 3000; echo 'the real problem'; exit 2\nunit: echo boom; exit 1\n")
+        payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop"}
+
+        res = subprocess.run([TURNSTILE, "hook", "claude-stop"], input=json.dumps(payload),
+                             env=r.env, capture_output=True, text=True, cwd=r.root)
+
+        reason = json.loads(res.stdout)["reason"]
+        self.assertTrue(reason.startswith("lint: exit 2, the real problem\nunit: exit 1, boom\n"), reason[:200])
+
+
 class StopHook(unittest.TestCase):
-    def stop(self, r: Repo, active: bool = False) -> subprocess.CompletedProcess:
+    def stop(self, r: Repo, active: bool = False, env: dict | None = None) -> subprocess.CompletedProcess:
         payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop",
                    "stop_hook_active": active}
-        return subprocess.run([STOP_HOOK], input=json.dumps(payload), env=r.env,
-                              capture_output=True, text=True, cwd=r.root)
+        return subprocess.run([TURNSTILE, "hook", "claude-stop"], input=json.dumps(payload),
+                              env={**r.env, **(env or {})}, capture_output=True, text=True,
+                              cwd=r.root)
 
     def test_repo_without_turnstile_config_is_left_alone(self):
         r = Repo(self)
@@ -524,6 +1164,14 @@ class StopHook(unittest.TestCase):
 
         self.assertEqual(json.loads(res.stdout)["decision"], "block")
 
+    def test_a_failing_push_only_check_does_not_block_the_stop(self):
+        r = Repo(self)
+        r.config("unit: true\npush e2e: false\n")
+
+        res = self.stop(r)
+
+        self.assertEqual(res.stdout.strip(), "")
+
     def test_ai_modules_do_not_run_on_stop(self):
         r = Repo(self)
         r.write(".turnstile.d/modules/m.md", "---\nname: m\n---\nReview it.\n")
@@ -535,6 +1183,290 @@ class StopHook(unittest.TestCase):
 
         self.assertEqual(r.prompts(), [])
 
+    def test_malformed_payload_never_breaks_the_session(self):
+        r = Repo(self)
+        r.config("unit: false\n")
+
+        res = r.turnstile("hook", "claude-stop", stdin="not json")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.strip(), "")
+
+    def test_a_slow_uncached_run_says_why_the_stop_took_long(self):
+        r = Repo(self)
+        r.config("slow: sleep 1.2\n")
+
+        res = self.stop(r, env={"TURNSTILE_SLOW_NOTICE": "1"})
+
+        message = json.loads(res.stdout)["systemMessage"]
+        self.assertIn("checks took", message)
+        self.assertIn("later stops reuse", message)
+
+    def test_a_fast_run_stays_silent(self):
+        r = Repo(self)
+        r.config("fast: true\n")
+
+        res = self.stop(r, env={"TURNSTILE_SLOW_NOTICE": "30"})
+
+        self.assertEqual(res.stdout.strip(), "")
+
+    def test_unknown_hook_is_refused(self):
+        r = Repo(self)
+
+        res = r.turnstile("hook", "nope")
+
+        self.assertNotEqual(res.returncode, 0)
+
+
+FAKE_NIX = """#!/bin/sh
+echo "$*" >> "$NIX_LOG"
+[ -z "${NIX_FAILS:-}" ] || { echo "error: flake has no devShell" >&2; exit 1; }
+[ "$1" = print-dev-env ] || exit 1
+echo 'export DEVENV_TOOL=from-devenv'
+[ -z "${FAKE_BASH:-}" ] || echo "BASH='$FAKE_BASH'"
+"""
+
+
+class StopInDevEnvironment(unittest.TestCase):
+    def setUp(self):
+        r = self.r = Repo(self)
+        self.nix_log = os.path.join(r.tmp, "nix-log")
+        self.seen = os.path.join(r.tmp, "seen")
+        r.fake("nix", FAKE_NIX)
+        os.symlink(TURNSTILE, os.path.join(r.fakebin, "turnstile"))
+        r.write("flake.nix", "{}\n")
+        r.write("flake.lock", "{}\n")
+        r.config(f'probe: printf "%s" "${{DEVENV_TOOL:-bare}}" > {self.seen}\n')
+        r.commit_all("flake")
+        self.env = {**r.env, "NIX_LOG": self.nix_log, "CLAUDE_PROJECT_DIR": r.root}
+
+    def stop(self, **extra: str) -> subprocess.CompletedProcess:
+        with open(SETTINGS) as fh:
+            command = json.load(fh)["hooks"]["Stop"][0]["hooks"][0]["command"]
+        payload = {"session_id": "s1", "cwd": self.r.root, "hook_event_name": "Stop"}
+        return subprocess.run(["/bin/sh", "-c", command], input=json.dumps(payload),
+                              env={**self.env, **extra}, capture_output=True, text=True,
+                              cwd=self.r.tmp)
+
+    def nix_calls(self) -> list[str]:
+        try:
+            with open(self.nix_log) as fh:
+                return fh.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def probed(self) -> str:
+        with open(self.seen) as fh:
+            return fh.read()
+
+    def test_checks_run_inside_the_projects_dev_environment(self):
+        res = self.stop()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.probed(), "from-devenv")
+        self.assertEqual(len(self.nix_calls()), 1)
+        self.assertTrue(self.nix_calls()[0].startswith("print-dev-env"))
+
+    def test_the_dev_environment_is_cached_under_the_git_dir(self):
+        self.stop()
+
+        cached = os.listdir(os.path.join(self.r.root, ".git", "turnstile"))
+        self.assertEqual(len(cached), 1, cached)
+
+    def test_a_second_stop_does_not_ask_nix_again(self):
+        self.stop()
+        self.r.write("a.txt", "edited\n")
+
+        res = self.stop()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(len(self.nix_calls()), 1)
+        self.assertEqual(self.probed(), "from-devenv")
+
+    def test_editing_flake_lock_rebuilds_the_dev_environment(self):
+        self.stop()
+        self.r.write("flake.lock", '{"version": 7}\n')
+
+        self.stop()
+
+        self.assertEqual(len(self.nix_calls()), 2)
+        self.assertEqual(len(os.listdir(os.path.join(self.r.root, ".git", "turnstile"))), 1)
+
+    def test_already_inside_a_nix_shell_nix_is_not_asked(self):
+        res = self.stop(IN_NIX_SHELL="impure")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.nix_calls(), [])
+        self.assertEqual(self.probed(), "bare")
+
+    def test_already_inside_direnv_nix_is_not_asked(self):
+        self.stop(DIRENV_DIR="-/some/project")
+
+        self.assertEqual(self.nix_calls(), [])
+        self.assertEqual(self.probed(), "bare")
+
+    def test_a_project_without_a_flake_runs_bare(self):
+        self.r.git("rm", "-q", "flake.nix", "flake.lock")
+        self.r.commit_all("no flake")
+
+        self.stop()
+
+        self.assertEqual(self.nix_calls(), [])
+        self.assertEqual(self.probed(), "bare")
+
+    def test_a_repo_without_turnstile_config_never_builds_an_environment(self):
+        self.r.git("rm", "-q", ".turnstile")
+        self.r.commit_all("ungated")
+
+        res = self.stop()
+
+        self.assertEqual(self.nix_calls(), [])
+        self.assertEqual(res.stdout.strip(), "")
+
+    def test_without_nix_the_checks_run_bare(self):
+        os.unlink(os.path.join(self.r.fakebin, "nix"))
+
+        res = self.stop()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.probed(), "bare")
+
+    def test_a_failed_environment_build_is_reported_and_the_checks_still_run(self):
+        res = self.stop(NIX_FAILS="1")
+
+        message = json.loads(res.stdout)["systemMessage"]
+        self.assertIn("could not build the dev environment", message)
+        self.assertIn("flake has no devShell", message)
+        self.assertEqual(self.probed(), "bare")
+        self.assertEqual(os.listdir(os.path.join(self.r.root, ".git", "turnstile")), [])
+
+    def test_the_profile_is_sourced_with_the_bash_it_names(self):
+        bash_log = os.path.join(self.r.tmp, "bash-log")
+        self.r.fake("devenv-bash", f'#!/bin/sh\necho used >> {bash_log}\nexec /bin/bash "$@"\n')
+
+        self.stop(FAKE_BASH=os.path.join(self.r.fakebin, "devenv-bash"))
+
+        self.assertTrue(os.path.exists(bash_log))
+        self.assertEqual(self.probed(), "from-devenv")
+
+    def test_building_the_environment_is_announced_once(self):
+        first = self.stop()
+        self.r.write("a.txt", "edited\n")
+        second = self.stop()
+
+        self.assertIn("built the dev environment (first run", json.loads(first.stdout)["systemMessage"])
+        self.assertEqual(second.stdout.strip(), "")
+
+    def test_the_announcement_rides_along_with_a_block(self):
+        self.r.config("unit: false\n")
+
+        out = json.loads(self.stop().stdout)
+
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("built the dev environment", out["systemMessage"])
+
+    def test_a_red_check_still_blocks_with_the_payload_read_through_the_environment(self):
+        self.r.config("unit: false\n")
+
+        res = self.stop()
+
+        self.assertEqual(json.loads(res.stdout)["decision"], "block")
+
+
+class ClaudeSettingsBlock(unittest.TestCase):
+    def setUp(self):
+        with open(SETTINGS) as fh:
+            self.command = json.load(fh)["hooks"]["Stop"][0]["hooks"][0]["command"]
+        self.tmp = tempfile.mkdtemp(prefix="turnstile-shim-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.project = os.path.join(self.tmp, "project")
+        os.makedirs(self.project)
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+
+    def fake(self, name: str) -> None:
+        path = os.path.join(self.bin, name)
+        with open(path, "w") as fh:
+            fh.write(f'#!/bin/sh\necho "{name} $*"\n')
+        os.chmod(path, 0o755)
+
+    def run_hook(self) -> subprocess.CompletedProcess:
+        env = {"PATH": self.bin, "CLAUDE_PROJECT_DIR": self.project}
+        return subprocess.run(["/bin/sh", "-c", self.command], input="{}", env=env,
+                              capture_output=True, text=True, cwd=self.tmp)
+
+    def test_print_claude_settings_prints_the_committed_block(self):
+        res = subprocess.run([TURNSTILE, "print-claude-settings"], capture_output=True, text=True)
+
+        with open(SETTINGS) as fh:
+            self.assertEqual(res.stdout, fh.read())
+
+    def test_readme_shows_the_committed_block(self):
+        with open(SETTINGS) as fh, open(os.path.join(HOME, "README.md")) as readme:
+            self.assertIn(fh.read(), readme.read())
+
+    def test_the_spinner_says_what_a_slow_first_run_is_doing(self):
+        with open(SETTINGS) as fh:
+            hook = json.load(fh)["hooks"]["Stop"][0]["hooks"][0]
+
+        self.assertIn("dev environment", hook["statusMessage"])
+
+    def test_installed_turnstile_is_used_first(self):
+        self.fake("turnstile")
+        self.fake("nix")
+        open(os.path.join(self.project, "flake.nix"), "w").close()
+
+        res = self.run_hook()
+
+        self.assertEqual(res.stdout.strip(), "turnstile hook claude-stop")
+
+    def test_a_flake_without_turnstile_on_path_goes_through_nix_develop(self):
+        self.fake("nix")
+        open(os.path.join(self.project, "flake.nix"), "w").close()
+
+        res = self.run_hook()
+
+        self.assertEqual(res.stdout.strip(), "nix develop -c turnstile hook claude-stop")
+
+    def test_without_turnstile_or_a_flake_it_says_so_and_lets_the_agent_stop(self):
+        self.fake("nix")
+
+        res = self.run_hook()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("turnstile is not installed", json.loads(res.stdout)["systemMessage"])
+
+
+def all_test_names(suite: unittest.TestSuite) -> list[str]:
+    names = []
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            names.extend(all_test_names(item))
+        else:
+            names.append(item.id().removeprefix("__main__."))
+    return names
+
+
+def run_in_parallel() -> int:
+    names = all_test_names(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
+    jobs = int(os.environ.get("TURNSTILE_TEST_JOBS") or min(8, os.cpu_count() or 1))
+
+    def run(name: str) -> tuple[str, subprocess.CompletedProcess]:
+        proc = subprocess.run([sys.executable, os.path.abspath(__file__), name],
+                              capture_output=True, text=True)
+        return name, proc
+
+    failed = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        for name, proc in pool.map(run, names):
+            if proc.returncode != 0:
+                failed.append(name)
+                print(f"FAILED {name}\n{proc.stderr}", file=sys.stderr)
+    print(f"Ran {len(names)} tests, {len(failed)} failed", file=sys.stderr)
+    return 1 if failed else 0
+
 
 if __name__ == "__main__":
-    unittest.main()
+    if len(sys.argv) > 1:
+        unittest.main()
+    sys.exit(run_in_parallel())

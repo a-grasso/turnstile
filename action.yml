@@ -1,0 +1,22 @@
+name: turnstile
+description: Run the checks of a pull request's base branch, as .turnstile defines them there
+inputs:
+  base:
+    description: Ref or sha the pull request is judged against
+    default: ${{ github.event.pull_request.base.sha }}
+runs:
+  using: composite
+  steps:
+    - uses: cachix/install-nix-action@v31
+    - name: turnstile ci
+      shell: bash
+      env:
+        BASE: ${{ inputs.base }}
+      run: |
+        git cat-file -e "$BASE^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$BASE"
+        turnstile=$(nix build --no-link --print-out-paths "path:${{ github.action_path }}")/bin/turnstile
+        if [ -f flake.nix ]; then
+          nix develop --no-write-lock-file -c "$turnstile" ci --base "$BASE"
+        else
+          "$turnstile" ci --base "$BASE"
+        fi

@@ -65,11 +65,12 @@ CONFIG_NAME=".turnstile"
 repo_root() { git rev-parse --show-toplevel 2>/dev/null; }
 
 config_path() {
+  if [ -n "${CONFIG_OVERRIDE:-}" ]; then printf '%s' "$CONFIG_OVERRIDE"; return; fi
   local root; root="$(repo_root)" || return 1
   [ -n "$root" ] && printf '%s/%s' "$root" "$CONFIG_NAME"
 }
 
-# Emits "name<US>scope<US>command" (US = \\037) per configured *deterministic* check.
+# Emits "name<US>scope<US>tier<US>command" (US = \\037) per configured *deterministic* check.
 #
 # Format is deliberately line-oriented rather than YAML/TOML: no parser
 # dependency, and a config that cannot express anything but a list of commands
@@ -78,6 +79,7 @@ config_path() {
 #   # comment
 #   lint: make lint
 #   cli [cli/** go.work]: make -C cli test    <- runs only when the change touches these
+#   push e2e [web/**]: make e2e               <- too slow for every agent turn; push and CI only
 #   ai review: block=high     <- not a command; owned by bin/turnstile-ai
 #   intent: gh issue view ... <- not a check; feeds the ai modules
 #
@@ -111,14 +113,20 @@ read_checks() {
         ;;
       intent) continue ;;
     esac
-    local scope=""
+    local scope="" tier=""
+    case "$name" in
+      push\ ?*)
+        tier=push
+        name="${name#push }"; name="${name#"${name%%[![:space:]]*}"}"
+        ;;
+    esac
     case "$name" in
       *\[*\])
         scope="${name#*\[}"; scope="${scope%\]}"
         name="${name%%\[*}"; name="${name%"${name##*[![:space:]]}"}"
         ;;
     esac
-    printf '%s\037%s\037%s\n' "$name" "$scope" "$cmd"
+    printf '%s\037%s\037%s\037%s\n' "$name" "$scope" "$tier" "$cmd"
   done < "$cfg"
 }
 
@@ -144,9 +152,41 @@ read_ai_checks() {
 
 AI_RUNNER="$TURNSTILE_BIN/turnstile-ai"
 
+# ---------------------------------------------------------------- approval
+
+ALLOWED_DIR="${TURNSTILE_ALLOWED:-$HOME/.turnstile/allowed}"
+UNAPPROVED_MESSAGE="turnstile: $CONFIG_NAME changed since you approved it, run \`turnstile allow\` after reviewing it"
+
+# One approval per repo and content, as direnv does: the same file in another
+# clone is a different file to approve. The common dir is the identity, so a
+# worktree of the repo shares its approvals.
+approval_file() {
+  local cfg common; cfg="$(config_path)" || return 1
+  common="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)" || return 1
+  { printf '%s\n' "$common"; cat "$cfg"; } | git hash-object --stdin | sed "s#^#$ALLOWED_DIR/#"
+}
+
+# A repo with no config has nothing to approve.
+config_approved() {
+  local cfg; cfg="$(config_path)" || return 0
+  [ -f "$cfg" ] || return 0
+  [ -f "$(approval_file)" ]
+}
+
+cmd_allow() {
+  repo_root >/dev/null || die "not inside a git repository"
+  [ -f "$(config_path)" ] || die "no $CONFIG_NAME in $(repo_root) - nothing to approve"
+  mkdir -p "$ALLOWED_DIR"
+  repo_root >"$(approval_file)"
+  say "  ${C_GREEN}✓${C_RESET} approved $CONFIG_NAME in $(repo_root)"
+}
+
 # ---------------------------------------------------------------- push range
 
 ZERO="0000000000000000000000000000000000000000"
+# A base with no usable fork point: diffing against git's empty tree checks a
+# first push in full, where the root commit would drop every file it introduced.
+EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 # Reads pre-push stdin ("<local ref> <local sha> <remote ref> <remote sha>")
 # and exports the range being pushed, so checks can scope themselves to the
@@ -185,12 +225,31 @@ compute_ranges() {
   return $found
 }
 
+# The remote branch the change was cut from, not always the default one: a
+# branch off `develop` diffed against `main` drags every unreleased commit into
+# the review. Nearest wins, measured as commits between fork point and head;
+# ties go to origin/HEAD, then origin/main and origin/master.
 default_base() {
+  local head="$1" nearest refs
+  # One git call, not two per remote branch: with sixty renovate branches the
+  # loop below costs ten seconds, on every agent turn.
+  if refs="$(git for-each-ref --format="%(refname) %(ahead-behind:$head)" \
+      refs/remotes refs/heads/main refs/heads/master 2>/dev/null)"; then
+    nearest="$(awk '$3 > 0 && ($1 == "refs/remotes/origin/HEAD" || $1 !~ /\/HEAD$/) {
+        p = $1 == "refs/remotes/origin/HEAD" ? 0 : $1 == "refs/remotes/origin/main" ? 1 \
+          : $1 == "refs/remotes/origin/master" ? 2 : $1 ~ /^refs\/remotes\// ? 3 : 4
+        print $3, p, $1
+      }' <<<"$refs" | sort -n -k1,1 -k2,2 | head -n1 | cut -d' ' -f3)"
+    if [ -n "$nearest" ] && git merge-base "$nearest" "$head" 2>/dev/null; then return 0; fi
+    printf '%s' "$EMPTY_TREE"
+    return 0
+  fi
+  default_base_per_branch "$head"
+}
+
+# git before 2.41 has no %(ahead-behind).
+default_base_per_branch() {
   local head="$1" b mb ahead best="" best_ahead=""
-  # The remote branch the change was cut from, not always the default one: a
-  # branch off `develop` diffed against `main` drags every unreleased commit
-  # into the review. Nearest wins, measured as commits between fork point and
-  # head; ties go to the earlier candidate, so origin/HEAD first.
   while IFS= read -r b; do
     mb="$(git merge-base "$b" "$head" 2>/dev/null)" || continue
     ahead="$(git rev-list --count "$mb..$head" 2>/dev/null)" || continue
@@ -207,11 +266,7 @@ default_base() {
     git for-each-ref --format='%(refname:short)' refs/remotes | grep -v '/HEAD$'
     printf '%s\n' main master
   )
-  if [ -n "$best" ]; then printf '%s' "$best"; return 0; fi
-  # Nothing usable: diff against git's empty tree so a first push is checked in
-  # full. Using the root commit instead would silently drop every file the root
-  # commit introduced.
-  printf '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+  printf '%s' "${best:-$EMPTY_TREE}"
 }
 
 # ---------------------------------------------------------------- the change
@@ -279,6 +334,18 @@ check_key() {
 
 # ---------------------------------------------------------------- run checks
 
+# Exit status a check uses for "cannot run here" (autotools' skip code): not a
+# failure, never cached, and counted in the summary so a quiet gate never reads
+# as a thorough one.
+SKIP_STATUS=77
+
+# The last line of a log that says something: blank lines, bare punctuation and
+# make's own "*** Error" trailer are what a failing command ends in.
+last_line() {
+  grep -v -E '^[[:space:]]*([[:punct:]]*|make(\[[0-9]+\])?: \*\*\*.*)$' "$1" \
+    | tail -n 1 | sed -e 's/^[[:space:]]*//' | cut -c1-160
+}
+
 # Runs every configured check, buffering output and surfacing it only on
 # failure. Returns the number of failures.
 #
@@ -294,11 +361,12 @@ check_key() {
 # contributions, that is the fix, not a sandbox.
 run_checks() {
   local label="${1:-turnstile}"
-  local -a names=() scopes=() cmds=()
-  local name scope cmd
+  TURNSTILE_UNRUNNABLE=0
+  local -a names=() scopes=() tiers=() cmds=()
+  local name scope tier cmd
 
-  while IFS=$'\x1f' read -r name scope cmd; do
-    names+=("$name"); scopes+=("$scope"); cmds+=("$cmd")
+  while IFS=$'\x1f' read -r name scope tier cmd; do
+    names+=("$name"); scopes+=("$scope"); tiers+=("$tier"); cmds+=("$cmd")
   done < <(read_checks)
 
   local ai_count=0
@@ -328,13 +396,15 @@ run_checks() {
   mkdir -p "$CHECK_CACHE"
   find "$CHECK_CACHE" -type f -mtime +"$CHECK_CACHE_DAYS" -delete 2>/dev/null
 
-  local failures=0 i out rc start elapsed
+  local failures=0 i rc elapsed
 
   # The AI modules start first and run while the deterministic checks do. They
   # are the slow half by two orders of magnitude, so paying for them serially
   # after a passing test suite would make the gate feel like it hangs.
   local ai_pid="" ai_log="$logdir/ai.log"
-  if [ "$ai_count" -gt 0 ] && [ -n "${TURNSTILE_NO_AI:-}" ]; then
+  if [ "$ai_count" -gt 0 ] && [ -n "${TURNSTILE_CI:-}" ]; then
+    dim "  · ai modules do not run in ci"
+  elif [ "$ai_count" -gt 0 ] && [ -n "${TURNSTILE_NO_AI:-}" ]; then
     dim "  · ai modules not run here (they run once, at push)"
   elif [ "$ai_count" -gt 0 ]; then
     if [ -x "$AI_RUNNER" ]; then
@@ -347,76 +417,114 @@ run_checks() {
   fi
 
   local tree_before tree_after rewritten key fresh g git_local_env
+  local -a keys=() notes=() pending=() pids=() ran=()
   git_local_env="$(git rev-parse --local-env-vars)"
   tree_before="$(cd "$root" && snapshot_tree)"
 
   for i in "${!names[@]}"; do
     name="${names[$i]}"; scope="${scopes[$i]}"; cmd="${cmds[$i]}"
-    out="$logdir/$i.log"
+
+    if [ -n "${TURNSTILE_AT_STOP:-}" ] && [ "${tiers[$i]}" = push ]; then
+      notes[i]="$(printf '  %s· %s (at push)%s' "$C_DIM" "$name" "$C_RESET")"
+      continue
+    fi
 
     local -a globs=() specs=()
     read -ra globs <<<"$scope"
     for g in "${globs[@]+"${globs[@]}"}"; do specs+=(":(glob)$g"); done
 
     if [ "${#specs[@]}" -gt 0 ] && [ -z "$(cd "$root" && changed_names "${specs[@]}")" ]; then
-      printf '  %s· %s (not touched)%s\n' "$C_DIM" "$name" "$C_RESET" >&2
+      notes[i]="$(printf '  %s· %s (not touched)%s' "$C_DIM" "$name" "$C_RESET")"
       continue
     fi
 
     key="$(cd "$root" && check_key "$name" "$cmd" "$(content_key "${specs[@]+"${specs[@]}"}")")"
     if [ -z "${TURNSTILE_NO_CACHE:-}" ] && [ -f "$CHECK_CACHE/$key" ]; then
-      printf '  %s✓%s %s %s(cached)%s\n' "$C_GREEN" "$C_RESET" "$name" "$C_DIM" "$C_RESET" >&2
+      notes[i]="$(printf '  %s✓%s %s %s(cached)%s' "$C_GREEN" "$C_RESET" "$name" "$C_DIM" "$C_RESET")"
       continue
     fi
 
-    start=$SECONDS
-    [ -n "$CLEAR_LINE" ] && printf '  %s… %s%s' "$C_DIM" "$name" "$C_RESET" >&2
+    keys[i]="$key"; pending+=("$i"); ran+=("$name")
     # Checks must not inherit the hook's stdin (the ref list); one `read` in a
     # check script would otherwise hang the push. Nor git's hook environment:
     # with GIT_DIR exported, a test suite that builds a temp repo commits into
     # this one instead.
     # shellcheck disable=SC2086
-    ( cd "$root" && unset $git_local_env && eval "$cmd" ) >"$out" 2>&1 </dev/null
-    rc=$?
-    elapsed=$((SECONDS - start))
+    (
+      start=$SECONDS
+      ( cd "$root" && unset $git_local_env && eval "$cmd" ) >"$logdir/$i.log" 2>&1 </dev/null
+      printf '%s %s\n' "$?" "$((SECONDS - start))" >"$logdir/$i.status"
+    ) &
+    pids+=($!)
+  done
 
-    # A check that rewrites the tree (a formatter in fix mode, say) passed
-    # against files that no longer exist, so its pass describes nothing.
-    rewritten=""
-    if fresh="$(cd "$root" && snapshot_index)"; then
-      rm -f "$SNAPSHOT"; SNAPSHOT="$fresh"
-      tree_after="$(cd "$root" && snapshot_tree)"
-      if [ "$tree_after" != "$tree_before" ]; then
-        rewritten="$(git -C "$root" diff-tree -r --name-only "$tree_before" "$tree_after")"
-        tree_before="$tree_after"
-      fi
-    fi
-
+  if [ "${#pids[@]}" -gt 0 ]; then
+    [ -n "$CLEAR_LINE" ] && printf '  %s… %s%s' "$C_DIM" "${ran[*]}" "$C_RESET" >&2
+    wait "${pids[@]}"
     printf '%s' "$CLEAR_LINE" >&2
-    if [ $rc -eq 0 ] && [ -z "$rewritten" ]; then
+  fi
+
+  # A check that rewrites the tree (a formatter in fix mode, say) passed
+  # against files that no longer exist, so its pass describes nothing. Checks
+  # run concurrently, so the rewrite is pinned on the batch, not on one check.
+  rewritten=""
+  if [ "${#pending[@]}" -gt 0 ] && fresh="$(cd "$root" && snapshot_index)"; then
+    rm -f "$SNAPSHOT"; SNAPSHOT="$fresh"
+    tree_after="$(cd "$root" && snapshot_tree)"
+    [ "$tree_after" != "$tree_before" ] \
+      && rewritten="$(git -C "$root" diff-tree -r --name-only "$tree_before" "$tree_after")"
+  fi
+
+  local -a summary=()
+  local summarised
+  for i in "${!names[@]}"; do
+    [ -f "$logdir/$i.status" ] || continue
+    read -r rc elapsed <"$logdir/$i.status"
+    [ "$rc" -eq 0 ] || [ "$rc" -eq "$SKIP_STATUS" ] && continue
+    summarised="$(last_line "$logdir/$i.log")"
+    summary+=("${names[$i]}: exit $rc${summarised:+, $summarised}")
+  done
+  [ -n "$rewritten" ] && summary+=("tree: modified while ${ran[*]} ran ($(printf '%s' "$rewritten" | tr '\n' ' ' | cut -c1-120))")
+  if [ "${#summary[@]}" -gt 0 ]; then
+    say "  ${C_RED}${C_BOLD}failing${C_RESET}"
+    printf '    %s\n' "${summary[@]}" >&2
+    say ""
+    [ -n "${TURNSTILE_SUMMARY_FILE:-}" ] && printf '%s\n' "${summary[@]}" >"$TURNSTILE_SUMMARY_FILE"
+  fi
+
+  for i in "${!names[@]}"; do
+    if [ -n "${notes[i]:-}" ]; then printf '%s\n' "${notes[i]}" >&2; continue; fi
+    [ -f "$logdir/$i.status" ] || continue
+    name="${names[$i]}"; cmd="${cmds[$i]}"
+    read -r rc elapsed <"$logdir/$i.status"
+    if [ "$rc" -eq 0 ]; then
       printf '  %s✓%s %s %s(%ss)%s\n' "$C_GREEN" "$C_RESET" "$name" "$C_DIM" "$elapsed" "$C_RESET" >&2
-      : >"$CHECK_CACHE/$key"
+      [ -z "$rewritten" ] && [ -z "${TURNSTILE_CI:-}" ] && : >"$CHECK_CACHE/${keys[i]}"
       continue
     fi
-
+    if [ "$rc" -eq "$SKIP_STATUS" ]; then
+      TURNSTILE_UNRUNNABLE=$((TURNSTILE_UNRUNNABLE + 1))
+      printf '  %s?%s %s %s(could not run: %s)%s\n' "$C_YELLOW" "$C_RESET" "$name" "$C_DIM" "$(last_line "$logdir/$i.log")" "$C_RESET" >&2
+      continue
+    fi
     failures=$((failures + 1))
-    if [ $rc -ne 0 ]; then
-      printf '  %s✗%s %s %s(exit %s, %ss)%s\n' "$C_RED" "$C_RESET" "$name" "$C_DIM" "$rc" "$elapsed" "$C_RESET" >&2
-      say ""
-      dim "    \$ $cmd"
-      # Tail rather than the whole log: the failure is nearly always at the end,
-      # and a 5000-line test dump in a hook is how people learn to --no-verify.
-      sed -e 's/^/    /' <(tail -n 40 "$out") >&2
-    else
-      printf '  %s✗%s %s %s(modified the working tree, %ss)%s\n' "$C_RED" "$C_RESET" "$name" "$C_DIM" "$elapsed" "$C_RESET" >&2
-    fi
-    if [ -n "$rewritten" ]; then
-      say ""
-      say "    the check modified these files - review them, commit what is right, rerun:"
-      sed -e 's/^/      /' <<<"$rewritten" >&2
-    fi
+    printf '  %s✗%s %s %s(exit %s, %ss)%s\n' "$C_RED" "$C_RESET" "$name" "$C_DIM" "$rc" "$elapsed" "$C_RESET" >&2
+    say ""
+    dim "    \$ $cmd"
+    # Tail rather than the whole log: the failure is nearly always at the end,
+    # and a 5000-line test dump in a hook is how people learn to --no-verify.
+    sed -e 's/^/    /' <(tail -n 40 "$logdir/$i.log") >&2
     say ""
   done
+
+  if [ -n "$rewritten" ]; then
+    failures=$((failures + 1))
+    printf '  %s✗%s the working tree was modified while %s ran\n' "$C_RED" "$C_RESET" "${ran[*]}" >&2
+    say ""
+    say "    review these files, commit what is right, rerun:"
+    sed -e 's/^/      /' <<<"$rewritten" >&2
+    say ""
+  fi
 
   if [ -n "$ai_pid" ]; then
     if kill -0 "$ai_pid" 2>/dev/null; then
@@ -445,16 +553,74 @@ run_checks() {
 
 # ---------------------------------------------------------------- commands
 
+# Gives the shell's cwd the checks of one pushed ref. Results travel in globals
+# (GATE_*) so the same function serves the in-place run and the worktree run.
+gate_ref() {
+  GATE_FAILURES=0 GATE_UNRUNNABLE=0 GATE_DEGRADED=0 GATE_UNAPPROVED=
+  if ! config_approved; then
+    GATE_UNAPPROVED=1
+    return 0
+  fi
+  TURNSTILE_AI_DEGRADED=0
+  run_checks "$1"
+  GATE_FAILURES=$?
+  GATE_UNRUNNABLE=$TURNSTILE_UNRUNNABLE
+  GATE_DEGRADED=${TURNSTILE_AI_DEGRADED:-0}
+}
+
+PUSH_WORKTREE=""
+
+cleanup_push_worktree() {
+  [ -n "$PUSH_WORKTREE" ] || return 0
+  git worktree remove --force "$PUSH_WORKTREE" >/dev/null 2>&1
+  rm -rf "$PUSH_WORKTREE" "$PUSH_WORKTREE.result"
+  git worktree prune >/dev/null 2>&1
+  PUSH_WORKTREE=""
+}
+
+# The checks run on exactly the commit being pushed, not on whatever the working
+# tree happens to hold. Hooks are off for the checkout: post-checkout would run
+# the repo's own hook in a directory it knows nothing about.
+gate_in_worktree() {
+  local sha="$1" label="$2" git_local_env
+  git_local_env="$(git rev-parse --local-env-vars)"
+  PUSH_WORKTREE="$(mktemp -d "${TMPDIR:-/tmp}/turnstile-push.XXXXXX")" || return 1
+  if ! git -c core.hooksPath=/dev/null worktree add -q --detach "$PUSH_WORKTREE" "$sha" >/dev/null 2>&1; then
+    GATE_FAILURES=1 GATE_UNRUNNABLE=0 GATE_DEGRADED=0 GATE_UNAPPROVED=
+    say "  ${C_RED}✗${C_RESET} could not check out ${sha:0:7} to verify it"
+    cleanup_push_worktree
+    return 0
+  fi
+  # shellcheck disable=SC2086
+  (
+    unset $git_local_env
+    cd "$PUSH_WORKTREE" || exit 70
+    gate_ref "$label"
+    printf 'GATE_FAILURES=%s GATE_UNRUNNABLE=%s GATE_DEGRADED=%s GATE_UNAPPROVED=%s\n' \
+      "$GATE_FAILURES" "$GATE_UNRUNNABLE" "$GATE_DEGRADED" "$GATE_UNAPPROVED" >"$PUSH_WORKTREE.result"
+  )
+  # shellcheck disable=SC1090
+  if [ -f "$PUSH_WORKTREE.result" ]; then . "$PUSH_WORKTREE.result"; else GATE_FAILURES=1; fi
+  cleanup_push_worktree
+}
+
+# The working tree as one hash, untracked files included.
+working_tree() {
+  local snap; snap="$(snapshot_index)" || return 1
+  GIT_INDEX_FILE="$snap" git write-tree
+  rm -f "$snap"
+}
+
 cmd_pre_push() {
   if [ -n "${TURNSTILE_SKIP:-}" ]; then
     warn "turnstile: skipped via TURNSTILE_SKIP"
     return 0
   fi
 
-  local -a ranges=() refs=()
+  local -a ranges=() refs=() shas=()
   local range ref lsha rsha
   while IFS=$'\t' read -r range ref lsha rsha; do
-    ranges+=("$range"); refs+=("$ref")
+    ranges+=("$range"); refs+=("$ref"); shas+=("$lsha")
   done < <(compute_ranges)
 
   if [ "${#ranges[@]}" -eq 0 ]; then
@@ -462,10 +628,13 @@ cmd_pre_push() {
     return 0
   fi
 
+  trap cleanup_push_worktree EXIT INT TERM
+  local root; root="$(repo_root)" || die "not inside a git repository"
+
   # Every pushed ref is gated, in its own pass. Rare enough that the repeated
   # deterministic checks do not matter, and the AI cache means an identical
   # diff across two refs is not paid for twice.
-  local failures=0 i degraded=0
+  local failures=0 i degraded=0 unrunnable=0 unapproved=0
   for i in "${!ranges[@]}"; do
     TURNSTILE_MODE=push
     TURNSTILE_RANGE="${ranges[$i]}"
@@ -474,11 +643,35 @@ cmd_pre_push() {
     local label="pre-push → ${1:-remote}"
     [ "${#ranges[@]}" -gt 1 ] && label="$label  [${refs[$i]}]"
 
-    TURNSTILE_AI_DEGRADED=0
-    run_checks "$label"
-    failures=$((failures + $?))
-    degraded=$((degraded + ${TURNSTILE_AI_DEGRADED:-0}))
+    local in_place=1
+    if [ ! -f "$root/$CONFIG_NAME" ] && ! git cat-file -e "${shas[$i]}:$CONFIG_NAME" 2>/dev/null; then
+      gate_ref "$label"
+    elif [ "$(cd "$root" && working_tree)" != "$(git rev-parse "${shas[$i]}^{tree}" 2>/dev/null)" ]; then
+      in_place=0
+      label="$label  (${shas[$i]:0:7} in a temporary worktree)"
+      gate_in_worktree "${shas[$i]}" "$label"
+    else
+      gate_ref "$label"
+    fi
+
+    failures=$((failures + GATE_FAILURES))
+    degraded=$((degraded + GATE_DEGRADED))
+    [ -n "$GATE_UNAPPROVED" ] && unapproved=1
+    if [ "$in_place" -eq 0 ] && [ "$GATE_UNRUNNABLE" -gt 0 ]; then
+      warn "turnstile: could not verify ${shas[$i]:0:7}: $GATE_UNRUNNABLE check(s) could not run in a clean checkout of it"
+    else
+      unrunnable=$((unrunnable + GATE_UNRUNNABLE))
+    fi
   done
+
+  if [ "$unapproved" -eq 1 ]; then
+    say "$UNAPPROVED_MESSAGE"
+    return 1
+  fi
+
+  if [ "$unrunnable" -gt 0 ] && [ "$failures" -eq 0 ]; then
+    warn "turnstile: $unrunnable check(s) could not run - this push was NOT verified by them"
+  fi
 
   if [ "$degraded" -gt 0 ] && [ "$failures" -eq 0 ]; then
     warn "turnstile: $degraded ai module(s) could not run - this push was NOT reviewed by them"
@@ -496,13 +689,30 @@ cmd_pre_push() {
   return 0
 }
 
+# The entry for hook managers: husky, lefthook or a hand-written hook call it
+# with git's pre-push arguments and stdin. A global dispatcher that already
+# gated this push says so through the environment.
+cmd_pre_push_public() {
+  if [ -n "${TURNSTILE_IN_pre_push:-}" ]; then
+    dim "turnstile: already gated by the global dispatcher"
+    return 0
+  fi
+  cmd_pre_push "$@"
+}
+
 cmd_run() {
   local root; root="$(repo_root)" || die "not inside a git repository"
+
+  if ! config_approved; then
+    say "$UNAPPROVED_MESSAGE"
+    return 1
+  fi
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-ai)    TURNSTILE_NO_AI=1 ;;
       --no-cache) TURNSTILE_NO_CACHE=1 ;;
+      --stop)     TURNSTILE_NO_AI=1 TURNSTILE_AT_STOP=1 ;;
       *)          die "unknown option for run: $1" ;;
     esac
     shift
@@ -520,16 +730,28 @@ cmd_run() {
   TURNSTILE_BASE="$(git merge-base "$base" HEAD 2>/dev/null || git rev-parse "$base")"
   TURNSTILE_RANGE="${TURNSTILE_BASE}..HEAD"
 
-  run_checks "manual run"
-  local failures=$?
+  local label="manual run"
+  [ -n "${TURNSTILE_AT_STOP:-}" ] && label="agent stop"
+  run_checks "$label"
+  verdict $? "this push would be refused"
+}
+
+# Prints the closing line of a run and returns its status.
+verdict() {
+  local failures="$1" consequence="$2"
   say ""
   if [ "$failures" -gt 0 ]; then
-    say "  ${C_RED}${C_BOLD}$failures check(s) failed${C_RESET} - this push would be refused"
+    say "  ${C_RED}${C_BOLD}$failures check(s) failed${C_RESET} - $consequence"
     say ""
     return 1
   fi
+  local unran=""
+  [ "$TURNSTILE_UNRUNNABLE" -gt 0 ] && unran="$TURNSTILE_UNRUNNABLE check(s)"
   if [ "${TURNSTILE_AI_DEGRADED:-0}" -gt 0 ]; then
-    say "  ${C_GREEN}${C_BOLD}all checks passed${C_RESET} ${C_YELLOW}(${TURNSTILE_AI_DEGRADED} ai module(s) could not run)${C_RESET}"
+    unran="${unran:+$unran, }${TURNSTILE_AI_DEGRADED} ai module(s)"
+  fi
+  if [ -n "$unran" ]; then
+    say "  ${C_GREEN}${C_BOLD}all checks passed${C_RESET} ${C_YELLOW}($unran could not run)${C_RESET}"
   else
     say "  ${C_GREEN}${C_BOLD}all checks passed${C_RESET}"
   fi
@@ -537,17 +759,107 @@ cmd_run() {
   return 0
 }
 
+# Deterministic checks only, no pass cache, and the check list comes from the
+# base ref: a change cannot weaken the gate that judges it. What the listed
+# commands do still comes from the checked-out tree.
+cmd_ci() {
+  local base=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base)   base="${2:-}"; shift ;;
+      --base=*) base="${1#--base=}" ;;
+      *)        die "unknown option for ci: $1" ;;
+    esac
+    shift
+  done
+  [ -n "$base" ] || die "ci needs --base <ref>"
+  local root sha; root="$(repo_root)" || die "not inside a git repository"
+  sha="$(git rev-parse --verify --quiet "$base^{commit}")" || die "unknown base: $base"
+
+  if ! git cat-file -e "$sha:$CONFIG_NAME" 2>/dev/null; then
+    dim "turnstile ci: no $CONFIG_NAME at $base - nothing to run"
+    return 0
+  fi
+  CONFIG_OVERRIDE="$(mktemp "${TMPDIR:-/tmp}/turnstile-config.XXXXXX")"
+  git show "$sha:$CONFIG_NAME" >"$CONFIG_OVERRIDE"
+
+  TURNSTILE_NO_AI=1 TURNSTILE_NO_CACHE=1 TURNSTILE_CI=1
+  TURNSTILE_MODE=push
+  TURNSTILE_BASE="$(git merge-base "$sha" HEAD 2>/dev/null || printf '%s' "$sha")"
+  TURNSTILE_RANGE="${TURNSTILE_BASE}..HEAD"
+  run_checks "ci (checks from $base)"
+  local failures=$?
+  rm -f "$CONFIG_OVERRIDE"
+  verdict "$failures" "this change fails the checks of $base"
+}
+
 # The working tree as one hash, untracked files included. For the Stop hook,
 # which has to tell "the agent changed something" from "the agent gave up".
 cmd_tree() {
   local root; root="$(repo_root)" || die "not inside a git repository"
   cd "$root" || exit 1
-  SNAPSHOT="$(snapshot_index)" || die "could not snapshot the working tree"
-  snapshot_tree
-  rm -f "$SNAPSHOT"
+  working_tree || die "could not snapshot the working tree"
+}
+
+cmd_approved() {
+  repo_root >/dev/null || return 0
+  config_approved && return 0
+  printf '%s\n' "$UNAPPROVED_MESSAGE"
+  return 1
+}
+
+cmd_hook() {
+  case "${1:-}" in
+    claude-stop)
+      exec sh "$TURNSTILE_HOME/claude/stop-hook.sh"
+      ;;
+    *) die "unknown hook: ${1:-}  (known: claude-stop)" ;;
+  esac
+}
+
+cmd_print_claude_settings() {
+  cat "$TURNSTILE_HOME/claude/settings.json"
+}
+
+REPO_HOOK_MARKER='installed by `turnstile install --repo`'
+
+repo_hook_path() {
+  local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || die "not inside a git repository"
+  printf '%s/hooks/pre-push' "$common"
+}
+
+cmd_install_repo() {
+  local hook; hook="$(repo_hook_path)"
+  if [ -e "$hook" ] && ! grep -qF "$REPO_HOOK_MARKER" "$hook"; then
+    die "$hook already exists and is not turnstile's.
+    Call \`turnstile pre-push \"\$@\"\` from it, with git's stdin passed through."
+  fi
+  mkdir -p "$(dirname "$hook")"
+  cat >"$hook" <<HOOK
+#!/bin/sh
+# $REPO_HOOK_MARKER
+command -v turnstile >/dev/null 2>&1 || { echo "turnstile is not installed, so the pre-push checks of this repo did not run. See https://github.com/a-grasso/turnstile#install" >&2; exit 0; }
+exec turnstile pre-push "\$@"
+HOOK
+  chmod +x "$hook"
+  say "  ${C_GREEN}✓${C_RESET} wrote $hook"
+  if [ -n "$(git config --get core.hooksPath || true)" ]; then
+    warn "core.hooksPath is set, so git will not run $hook - call 'turnstile pre-push' from that hook manager instead"
+  fi
+}
+
+cmd_uninstall_repo() {
+  local hook; hook="$(repo_hook_path)"
+  if [ -e "$hook" ] && grep -qF "$REPO_HOOK_MARKER" "$hook"; then
+    rm -f "$hook"
+    say "  ${C_GREEN}✓${C_RESET} removed $hook"
+  else
+    warn "$hook is not turnstile's - leaving it alone"
+  fi
 }
 
 cmd_install() {
+  if [ "${1:-}" = "--repo" ]; then cmd_install_repo; return; fi
   local dispatch="$TURNSTILE_HOME/hooks/dispatch"
   [ -x "$dispatch" ] || die "missing or non-executable: $dispatch"
 
@@ -585,6 +897,7 @@ cmd_install() {
 }
 
 cmd_uninstall() {
+  if [ "${1:-}" = "--repo" ]; then cmd_uninstall_repo; return; fi
   local current
   current="$(git config --global --get core.hooksPath || true)"
   if [ "$current" = "$HOOKS_INSTALL_DIR" ]; then
@@ -642,11 +955,17 @@ cmd_status() {
 
   cfg="$(config_path)"
   if [ -f "$cfg" ]; then
+    if config_approved; then
+      say "  config      ${C_GREEN}approved${C_RESET}"
+    else
+      say "  config      ${C_YELLOW}not approved${C_RESET}  (review it, then: turnstile allow)"
+    fi
     say "  checks"
-    local name scope cmd
-    while IFS=$'\037' read -r name scope cmd; do
+    local name scope tier cmd
+    while IFS=$'\037' read -r name scope tier cmd; do
       printf '                %s%-10s%s %s\n' "$C_BOLD" "$name" "$C_RESET" "$cmd" >&2
       [ -n "$scope" ] && printf '                %-10s %swhen the change touches: %s%s\n' "" "$C_DIM" "$scope" "$C_RESET" >&2
+      [ -n "$tier" ] && printf '                %-10s %sat push only, not on agent stop%s\n' "" "$C_DIM" "$C_RESET" >&2
     done < <(read_checks)
     if [ "$(read_ai_checks | grep -c . || true)" -gt 0 ]; then
       say "  ai modules"
@@ -736,12 +1055,23 @@ usage() {
 
   ${C_BOLD}Usage${C_RESET}
     turnstile install      install the global hook dispatcher
-    turnstile uninstall    remove it
+    turnstile install --repo
+                           write only this repo's .git/hooks/pre-push
+    turnstile uninstall    remove it (--repo: this repo's hook)
+    turnstile pre-push     the gate, for a hook manager to call with git's pre-push stdin
+    turnstile allow        approve this repo's current .turnstile; runs refuse an unapproved one
     turnstile status       show gate + this repo's checks
     turnstile run          run this repo's checks on the working tree, without pushing
                            --no-ai     skip the ai modules (they run at push)
                            --no-cache  rerun checks that already passed on this tree
+                           --stop      what an agent's turn end runs: no ai, no push-only checks
+    turnstile ci --base <ref>
+                           CI: deterministic checks only, no cache, config read from <ref>
     turnstile ai [args]    run just the ai modules (see: turnstile ai --help)
+    turnstile hook claude-stop
+                           Claude Code Stop hook: reads the payload on stdin
+    turnstile print-claude-settings
+                           the Stop hook block for a project's .claude/settings.json
     turnstile doctor       diagnose the installation
 
   ${C_BOLD}Per-repo config${C_RESET} (${CONFIG_NAME} in the repo root)
@@ -759,12 +1089,18 @@ EOF
 
 case "${1:-}" in
   __pre-push)  shift; cmd_pre_push "$@" ;;
+  pre-push)    shift; cmd_pre_push_public "$@" ;;
   __tree)      cmd_tree ;;
-  install)     cmd_install ;;
-  uninstall)   cmd_uninstall ;;
+  __approved)  cmd_approved ;;
+  allow)       cmd_allow ;;
+  install)     shift; cmd_install "$@" ;;
+  uninstall)   shift; cmd_uninstall "$@" ;;
   status)      cmd_status ;;
   run)         shift; cmd_run "$@" ;;
+  ci)          shift; cmd_ci "$@" ;;
   ai)          shift; exec "$AI_RUNNER" "$@" ;;
+  hook)        shift; cmd_hook "$@" ;;
+  print-claude-settings) cmd_print_claude_settings ;;
   doctor)      cmd_doctor ;;
   ""|-h|--help|help) usage ;;
   --version)   printf '%s\n' "$TURNSTILE_VERSION" ;;

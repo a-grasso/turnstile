@@ -5,6 +5,9 @@ A mechanical gate on the push path.
 ```
   turnstile pre-push → origin
 
+  failing
+    test: exit 1, FAIL
+
   ✓ lint (2s)
   ✗ test (exit 1, 6s)
 
@@ -42,26 +45,18 @@ most and the moment it is least likely to be invoked.
 
 A hook has no judgment. It is on the road out or it isn't.
 
-Three enforcement points, covering different traffic:
+Two enforcement points, covering different traffic:
 
 | | catches | can be bypassed by |
 |---|---|---|
 | `pre-push` hook | you, agents, the IDE, anything calling git | a human typing `--no-verify` |
-| `PreToolUse` hook | Claude Code's Bash tool | you, by editing settings.json |
-| `Stop` hook | a Claude Code agent ending its turn on a red tree | you, by editing settings.json |
+| `Stop` hook | a Claude Code agent ending its turn on a red tree | editing `.claude/settings.json` |
 
-The `Stop` hook is the early one; see [the agent's loop](#the-agents-loop). The
-first two are a pair. `--no-verify` is the right escape hatch for a person: they
-have decided to take responsibility. It is the wrong one for an agent, which
-has decided nothing and is routing around a failing check because that makes
-the task look finished. So the second hook closes it, for the agent only.
-
-**How firmly it closes it: not very.** The blocker is regex over the command
-string, so `sh -c` wrapping, quote splitting, an alias, or a helper script that
-calls `git push --no-verify` itself all walk straight past it. It raises the
-cost of an accidental bypass from zero to deliberate; it is not a security
-boundary and cannot become one at this layer. The `pre-push` hook is the actual
-gate. This only stops the model from reflexively reaching for the hatch.
+The `Stop` hook is the early one; see [the agent's loop](#the-agents-loop).
+`--no-verify` is the right escape hatch for a person: they have decided to take
+responsibility. turnstile does not try to close it for an agent. The `pre-push`
+hook is the actual gate, and the `Stop` hook makes reaching for the hatch
+unnecessary by catching a red tree a turn earlier.
 
 ## Install
 
@@ -86,6 +81,7 @@ Then, per repo you want gated, a `.turnstile` file in the root:
 ```
 lint: make lint
 cli [cli/** go.work]: make -C cli test
+push e2e [web/**]: make e2e
 
 ai review:  block=high
 ai secrets: block=medium
@@ -95,25 +91,155 @@ Repos without one pass straight through. A check with a bracketed scope runs
 only when the change touches a file its globs match; see
 [scoped checks](#scoped-checks-and-the-pass-cache). See [examples/.turnstile](examples/.turnstile)<!--@13caced8-->.
 
-For the agent-side half, point a Claude Code `PreToolUse` hook at
-[claude/no-bypass.py](claude/no-bypass.py)<!--@360addfc--> and a `Stop` hook at
-[claude/verify-on-stop.py](claude/verify-on-stop.py)<!--@8c48e426-->. Each docstring has its
-settings.json block. Put them in your user settings rather than a repo's: both
-do nothing in a repo without a `.turnstile`, so a teammate who has not
-installed turnstile is never affected.
+For the agent-side half, commit a Claude Code `Stop` hook to the project's
+`.claude/settings.json`, so contributors install nothing for it.
+`turnstile print-claude-settings` prints the block, which is
+[claude/settings.json](claude/settings.json)<!--@049f7c8c-->:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"${CLAUDE_PROJECT_DIR:-.}\" || exit 0; command -v turnstile >/dev/null && exec turnstile hook claude-stop; if [ -f flake.nix ]; then for n in nix /nix/var/nix/profiles/default/bin/nix; do command -v $n >/dev/null && exec $n develop -c turnstile hook claude-stop; done; fi; echo '{\"systemMessage\": \"turnstile is not installed, so the checks of this repo did not run at agent stop. See https://github.com/a-grasso/turnstile#install\"}'",
+            "timeout": 900,
+            "statusMessage": "turnstile: running checks (a first run builds the dev environment)"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The command runs in the project directory and picks the first of three:
+
+1. `turnstile hook claude-stop`, when `turnstile` is on PATH. In a project with
+   a `flake.nix`, outside its dev shell (neither `IN_NIX_SHELL` nor
+   `DIRENV_DIR` set), the hook runs the checks in the project's toolchain
+   ([claude/stop-hook.sh](claude/stop-hook.sh)<!--@201741b3-->): it caches
+   `nix print-dev-env` under `.git/turnstile/`, keyed on the hash of
+   `flake.nix` and `flake.lock`, and sources it. That costs one evaluation per
+   change to those two files instead of the 25 to 44s `nix develop` takes on
+   every stop of a dirty tree. A file the flake imports is not part of the
+   key; delete `.git/turnstile/` after editing one. Without `nix`, or when the
+   build fails, the checks run bare and the hook says so.
+2. `nix develop -c turnstile hook claude-stop`, when turnstile is not on PATH,
+   the project has a `flake.nix` that puts it in its devShell (see
+   [Install with Nix](#install-with-nix)) and `nix` is on PATH or at
+   `/nix/var/nix/profiles/default/bin/nix`. This path pays the evaluation on
+   every stop; put turnstile on PATH to get the cache.
+3. A `systemMessage` saying turnstile is not installed, exit 0.
+
+The third is fail-open but visible, on purpose: a teammate who has not adopted
+turnstile is never blocked, and sees that the checks did not run. The fallback
+lives in the settings command and not in turnstile because it has to work when
+turnstile is absent. Repos without a `.turnstile` are left alone either way.
+
+Claude Code shows a hook's output only once it has finished, so a slow stop is
+explained twice: the spinner reads the block's `statusMessage` while the hook
+runs, and a `systemMessage` afterwards says what was slow, either that the dev
+environment was built or that the checks took ten seconds or more uncached
+(`TURNSTILE_SLOW_NOTICE` sets that threshold, in seconds).
+
+To leave global git config alone, `turnstile install --repo` writes only this
+repo's `.git/hooks/pre-push`, which calls `turnstile pre-push` (and says so,
+without blocking, when turnstile is missing). A hook manager can call
+`turnstile pre-push "$@"` itself, with git's stdin passed through: husky does
+that by default and lefthook needs `use_stdin: true`. The pre-commit framework
+does not forward stdin, so use `install --repo` there.
 
 Undo everything with `turnstile uninstall`.
+
+## Approving a config
+
+`.turnstile` is executed, and a clone or a pull can change it into code you have
+not read. So `turnstile run`, the pre-push gate and the Stop hook refuse to
+execute one whose content you have not approved:
+
+```
+turnstile: .turnstile changed since you approved it, run `turnstile allow` after reviewing it
+```
+
+`turnstile allow` approves the current content. Approvals live in
+`~/.turnstile/allowed/`, one per repo and content, the way direnv does it. The
+Stop hook shows the line as a message and does not block, because an agent that
+approves its own gate has not been gated. `turnstile ci` is exempt, since it
+reads the base branch's config and review has already approved that. Pre-push
+requires approval too, because it is the first moment a freshly cloned or pulled
+`.turnstile` would run on your machine, and refusing costs one command.
+
+## CI
+
+`turnstile ci --base <ref>` is the check CI can trust. It runs the deterministic
+checks only (no ai modules, no pass cache) over `base..HEAD`, and reads
+`.turnstile` from `<ref>` with `git show`, so a pull request that deletes or
+weakens a check is still judged by it. What a check's command does is still the
+checked-out code's business: a PR can edit the `Makefile` that `make lint`
+runs, so protect those files with CODEOWNERS.
+
+[action.yml](action.yml)<!--@c6445728-->, a composite GitHub Action, installs nix, builds
+turnstile from the action's own checkout and runs `turnstile ci` inside the
+project's devShell when it has a `flake.nix`:
+
+```yaml
+on: pull_request
+jobs:
+  turnstile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: a-grasso/turnstile@main
+```
+
+## Install with Nix
+
+Pin it per project with a flake input, and the version lives in `flake.lock`:
+
+```nix
+{
+  inputs.turnstile.url = "github:a-grasso/turnstile";
+  inputs.turnstile.inputs.nixpkgs.follows = "nixpkgs";
+
+  outputs = { nixpkgs, turnstile, ... }: let
+    system = "aarch64-darwin";
+    pkgs = nixpkgs.legacyPackages.${system};
+  in {
+    devShells.${system}.default = pkgs.mkShell {
+      packages = [ turnstile.packages.${system}.default ];
+    };
+  };
+}
+```
+
+Or run it once: `nix run github:a-grasso/turnstile -- doctor`.
+
+The package puts `turnstile` and `turnstile-ai` on PATH with `bash`, `git`,
+`python3` and the coreutils they need. `turnstile install` still writes the
+global `core.hooksPath`, pointing at the store path of the pinned version.
 
 ## Commands
 
 ```
 turnstile install      install the global hook dispatcher
-turnstile uninstall    remove it
+turnstile install --repo   write only this repo's .git/hooks/pre-push
+turnstile uninstall    remove it (--repo: this repo's hook)
+turnstile pre-push     the gate for hook managers, git's pre-push stdin on stdin
+turnstile allow        approve this repo's current .turnstile
 turnstile status       show gate state + this repo's checks
 turnstile run          run this repo's checks on the working tree, without pushing
   --no-ai              skip the ai modules (they run once, at push)
   --no-cache           rerun checks that already passed on this tree
+  --stop               what an agent's turn end runs: no ai, no push-only checks
+turnstile ci --base <ref>   CI: deterministic checks only, no cache, config read from <ref>
 turnstile ai [args]    run only the ai modules
+turnstile hook claude-stop        Claude Code Stop hook, payload on stdin
+turnstile print-claude-settings   the Stop hook block for .claude/settings.json
 turnstile doctor       diagnose the installation
 ```
 
@@ -130,6 +256,15 @@ one of the globs matches. Globs are git pathspec globs: `**` crosses
 directories, `*` does not. A scoped check that is skipped prints as
 `· name (not touched)`, so a quiet gate never reads as a thorough one.
 
+**Push-only.** `push name [glob ...]: command` is a check too slow for every
+agent turn: an e2e suite, a full frontend build. The Stop hook skips it and
+prints `· name (at push)`; pre-push, CI and a plain `turnstile run` still run
+it. The budget for what stays is about ten seconds warm, because the agent
+waits for it on every turn.
+
+**Parallel.** Checks that have to run start together, so the gate costs the
+slowest check rather than the sum. Results print in config order.
+
 **Pass cache.** A check that passes is recorded against what it could see:
 the files in its scope (the whole tree when unscoped), the command, and the
 base of the change. The same check on the same content is then
@@ -144,8 +279,17 @@ committed unchanged.
 
 **A check that rewrites files fails.** A formatter in fix mode passes against
 files that no longer exist, so turnstile compares the tree before and after
-each check and refuses a pass that changed it, listing the files. Commit what
+the checks and refuses a run that changed it, listing the files. Checks run
+concurrently, so the report names the batch rather than one check. Commit what
 is right and run again; the second run passes.
+
+**Cannot run here.** A check that exits 77 (the autotools skip code) could not
+run: no docker, a missing credential, a dependency a clean checkout lacks. It
+prints `? name (could not run: <last line of output>)`, is not a failure and is
+never cached. The summary counts it, as in `all checks passed (1 check(s) could
+not run)`, the way it counts ai modules that could not run, so a quiet gate
+never reads as a thorough one. The Stop hook lets the agent stop and says what
+did not run.
 
 Checks get `TURNSTILE_RANGE`, `TURNSTILE_BASE`, `TURNSTILE_CHANGED_FILES` and
 `TURNSTILE_DIFF_FILE` (the change as a patch) so they can scope themselves
@@ -156,16 +300,23 @@ further.
 ```
 agent writes code
   → runs a single test, as often as it likes        (its own business)
-  → ends its turn  → Stop hook: turnstile run --no-ai (cached, refuses red)
+  → ends its turn  → Stop hook: turnstile run --stop (cached, refuses red)
   → pushes         → pre-push: cached checks + ai modules, once
 ```
 
 The pre-push gate alone catches a failing check after the session that caused
-it has moved on. [claude/verify-on-stop.py](claude/verify-on-stop.py)<!--@8c48e426--> runs the
-deterministic checks whenever the agent ends a turn and, on failure, blocks the
-stop with the report, so the agent fixes it while it still has the context.
+it has moved on. `turnstile hook claude-stop`
+([claude/stop-hook.py](claude/stop-hook.py)<!--@e8046668-->) reads Claude Code's Stop
+payload, runs the deterministic checks that are not push-only whenever the
+agent ends a turn and, on failure, blocks the stop with the report, so the
+agent fixes it while it still has the context.
 Nothing depends on the agent remembering to verify, which is the argument
 against skills this tool started from.
+
+When the checks fail, the block reason opens with one line per failing check,
+`name: exit N, last meaningful line`, and only then the tails of their output,
+so the cause survives a long log being cut. `turnstile run` prints the same
+lines at the top of its failure report.
 
 The loop is bounded. When the checks still fail and the tree has not changed
 since the last refusal, the agent is let go and the failure is left for you.
@@ -397,9 +548,8 @@ is the second deterministic check on this repo's own docs.
 A reference opts in by carrying an empty pin, `<!--@-->` after the link, and
 `reflock stamp` fills it with a fingerprint of the target as it stands. `reflock
 check` recomputes and compares: a target that changed is `DRIFTED`, a target
-that no longer exists is `DANGLING`. Six references in this file are pinned,
-each one a place where the prose makes a claim about a file rather than merely
-linking to it.
+that no longer exists is `DANGLING`. Each pinned reference in this file is a place where the prose makes a claim
+about a file rather than merely linking to it.
 
 ```sh
 reflock check                       # what the `refs` gate runs
@@ -534,11 +684,15 @@ ability to edit the tree it is gating. A module can opt back in via
 cannot express anything but a list of commands cannot grow into a second
 configuration language.
 
-**Checks run in-tree, not in a worktree.** They see your working directory as
-it is. That is wrong for validation of a *pushed* range and right for a
-prototype that has to stay fast. The pass cache is keyed on that same working
-tree, so it never claims more than the checks saw. Worktree isolation belongs
-with the review stage, where it actually buys something.
+**Push checks the commits, not the tree.** When the working tree is exactly
+the pushed commit, the checks run in place. Otherwise (uncommitted work, another
+branch checked out, a branch pushed that is not checked out) they run in a
+temporary `git worktree` of the pushed commit, with hooks off, removed
+afterwards. A fresh checkout lacks what is untracked (`node_modules`, `.venv`),
+so a check that cannot run there should exit 77: the push then reports `could
+not verify <sha>` instead of going red. The pass cache is keyed on tree content,
+so both modes share it. `turnstile run` still checks the working tree, since
+checking uncommitted work is its job.
 
 **Every pushed ref is gated, in its own pass.** An earlier cut checked only the
 first content-bearing ref and warned about the rest, which was the wrong
