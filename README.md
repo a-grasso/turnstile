@@ -339,6 +339,17 @@ ai review:  block=never        # report findings, never refuse
 `block` names the lowest severity that refuses a push. Findings below it still
 print, marked `advisory`. Severities are `low`, `medium`, `high`, `critical`.
 
+A line takes three more keys. `model=<name>` picks the model, `timeout=<seconds>`
+sets how long the module may run, and `fail=closed` makes a module that cannot
+run refuse the push (see [Failure is open, on purpose](#failure-is-open-on-purpose)).
+A value that does not parse is a config error: the line is skipped and named in
+a warning.
+
+```
+ai review:  block=high timeout=900     # a slow module gets longer
+ai secrets: block=medium fail=closed   # never push unreviewed
+```
+
 Four built-ins ship:
 
 | module | finds | default block |
@@ -382,9 +393,11 @@ Report a finding when a migration drops a column or table with no
 down-path...
 ```
 
-`block` and `model` in frontmatter are the module's *defaults*. The
-`.turnstile` line overrides both (`ai review: block=critical model=opus`), so a
-module can declare what it needs without dictating it to every repo.
+`block`, `model` and `timeout` in frontmatter are the module's *defaults*. The
+`.turnstile` line overrides all three (`ai review: block=critical model=opus`),
+so a module can declare what it needs without dictating it to every repo.
+`fail` is read from the `.turnstile` line only: whether an unreviewed push is
+acceptable is the repo's call, not the module author's.
 
 Module files resolve **repo → user → built-in**, first hit wins:
 
@@ -430,10 +443,30 @@ network blip is a gate people learn to `--no-verify` past, which costs more
 than the review it was protecting. Pass `--strict` to invert that where you
 would rather stop.
 
-Diffs are capped at 4000 lines before they reach the model, and the truncation
-is stated in the report rather than silently narrowing what was reviewed. A
-module that overruns `TURNSTILE_AI_TIMEOUT` (default 300s) is killed as a
-process group, because a hook that hangs is worse than one that fails.
+A module is killed as a process group when it overruns its timeout, because a
+hook that hangs is worse than one that fails. The timeout comes from the
+module's `timeout=` key on its `.turnstile` line, else an explicit `--timeout`,
+else the `timeout:` in its frontmatter, else `TURNSTILE_AI_TIMEOUT` (default
+600s), the same order as `model`.
+
+A diff over budget (4000 lines or 400000 bytes by default) is cut one file at a
+time, never by chopping the tail. Source files go first and the smallest first,
+so the most files get a full review. Lockfiles, minified and generated files,
+`dist/`, `vendor/` and `node_modules/` paths, snapshots and binary patches go
+last. A file that fits only in part is cut with a marker line, and a file that
+does not fit is omitted. The omitted paths are named both to the author (a
+warning on stderr) and to the model (in a `NOTE` that tells it not to report on
+what it cannot see). The report marks such a review `partial review`, and a
+partial review is never recorded as a pass: the next push reviews the whole
+range again rather than treating the unread files as accepted.
+
+A module with `fail=closed` is the opt-in exception to failing open. When it
+cannot run, it prints `ai <name> (could not run: <reason>) [fail=closed]` and the
+push is refused, in every mode that runs it, including `--staged` in a
+pre-commit hook. That covers a module that cannot be found or loaded, a line
+whose options do not parse, and a diff that cannot be read. A module that runs
+and finds nothing still passes. Runs with `--module` ignore `fail=closed`.
+Without the key, behaviour is unchanged.
 
 When a module is skipped this way, the summary says so, printing `all checks
 passed (1 ai module(s) could not run)` rather than reporting a clean pass for
@@ -441,7 +474,9 @@ a review that never happened.
 
 ```
 TURNSTILE_MODEL         default model for all modules (default: sonnet)
-TURNSTILE_AI_TIMEOUT    per-module timeout in seconds (default: 300)
+TURNSTILE_AI_TIMEOUT    per-module timeout in seconds (default: 600)
+TURNSTILE_AI_MAX_DIFF_LINES  diff line budget per review (default: 4000)
+TURNSTILE_AI_MAX_DIFF_BYTES  diff byte budget per review (default: 400000)
 TURNSTILE_CACHE         cache directory (default: ~/.turnstile/cache/ai)
 ```
 

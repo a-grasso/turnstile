@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import functools
 import hashlib
 import json
 import os
@@ -38,14 +39,35 @@ SCHEMA_VERSION = 1
 SEVERITIES = ("low", "medium", "high", "critical")
 SEVERITY_RANK = {s: i + 1 for i, s in enumerate(SEVERITIES)}
 BLOCK_LEVELS = {"never": None, **{s: SEVERITY_RANK[s] for s in SEVERITIES}}
+FAIL_MODES = ("open", "closed")
 
 CONFIG_NAME = ".turnstile"
 
 # A diff larger than this is truncated before it reaches the model. Past a few
 # thousand lines the review degrades into skimming anyway, and an unbounded
 # hook is one pathological merge away from a context-limit error.
-MAX_DIFF_LINES = 4000
-MAX_DIFF_BYTES = 400_000
+@functools.cache
+def _env_int(name: str, default: int) -> int:
+    """A typo in an env var must cost the override, not the hook that reads it."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if re.fullmatch(r"[0-9]+", raw.strip()) and int(raw) > 0:
+        return int(raw)
+    print(f"! turnstile-ai: {name}='{raw}' is not a positive integer, using {default}",
+          file=sys.stderr)
+    return default
+
+
+MAX_DIFF_LINES = _env_int("TURNSTILE_AI_MAX_DIFF_LINES", 4000)
+MAX_DIFF_BYTES = _env_int("TURNSTILE_AI_MAX_DIFF_BYTES", 400_000)
+DEFAULT_TIMEOUT = 600
+
+# Below this much remaining line budget, cutting a file short shows too little
+# of it to review, so it is named as omitted instead.
+MIN_PARTIAL_LINES = 50
+NOTE_PATH_CAP = 30
+WARN_PATH_CAP = 10
 
 CACHE_TTL_SECONDS = 30 * 24 * 3600
 
@@ -248,22 +270,139 @@ def diff_for(range_spec: str | None, staged: bool, root: str,
     # -U8: a hook reviewer has no ability to open the file, so the hunk context
     # is the only surrounding code it will ever see. The default 3 lines is too
     # thin to tell a deliberate early-return from a missing guard.
-    diff = git(*args, "-U8", "--no-color", cwd=root)
-    files = [f for f in git(*args, "--name-only", cwd=root).splitlines() if f]
+    diff = git("-c", "core.quotePath=false", *args, "-U8", "--no-color", cwd=root)
+    files = [f for f in git("-c", "core.quotePath=false", *args, "--name-only", cwd=root).splitlines() if f]
     return diff, files
 
 
-def truncate_diff(diff: str) -> tuple[str, str | None]:
-    """Caps the diff, returning (diff, note-about-truncation)."""
+def diff_lines(text: str) -> list[str]:
+    """Lines as git counts them: only a newline ends one, form feeds and the like do not."""
+    parts = text.split("\n")
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def looks_generated(path: str, body: str = "") -> bool:
+    """Files nobody reviews line by line: they go last when the budget forces a choice."""
+    parts = path.split("/")
+    name = parts[-1]
+    if any(d in ("dist", "vendor", "node_modules") for d in parts[:-1]):
+        return True
+    if name in ("package-lock.json", "pnpm-lock.yaml", "go.sum"):
+        return True
+    if name.endswith((".lock", ".snap", "_pb2.py", "_pb2_grpc.py")):
+        return True
+    if ".min." in name or ".pb." in name:
+        return True
+    return any(line.startswith(("Binary files ", "GIT binary patch"))
+               for line in body.split("\n"))
+
+
+def split_segments(diff: str) -> list[dict]:
+    """One segment per `diff --git` file header, in diff order."""
+    segments: list[dict] = []
+    for line in diff_lines(diff):
+        if line.startswith("diff --git "):
+            header = line.rstrip("\r\n")
+            m = re.match(r"diff --git a/.* b/(.+)$", header)
+            path = m.group(1) if m else header[len("diff --git "):].strip()
+            segments.append({"path": path, "lines": [line]})
+        elif segments:
+            segments[-1]["lines"].append(line)
+    for seg in segments:
+        seg["generated"] = looks_generated(seg["path"], "".join(seg["lines"]))
+    return segments
+
+
+def list_paths(paths: list[str], cap: int) -> str:
+    listed = ", ".join(paths[:cap])
+    return f"{listed} (+{len(paths) - cap} more)" if len(paths) > cap else listed
+
+
+def truncate_by_position(diff: str) -> tuple[str, str | None, list[str]]:
     note = None
-    lines = diff.splitlines()
+    lines = diff_lines(diff)
     if len(lines) > MAX_DIFF_LINES:
-        diff = "\n".join(lines[:MAX_DIFF_LINES])
+        diff = "".join(lines[:MAX_DIFF_LINES]).removesuffix("\n")
         note = f"diff truncated to {MAX_DIFF_LINES} of {len(lines)} lines"
     if len(diff.encode()) > MAX_DIFF_BYTES:
         diff = diff.encode()[:MAX_DIFF_BYTES].decode("utf-8", "ignore")
         note = f"diff truncated to {MAX_DIFF_BYTES} bytes"
-    return diff, note
+    return diff, note, []
+
+
+def select_diff(diff: str) -> tuple[str, str | None, list[str]]:
+    """Fits the diff to the budget one file at a time.
+
+    Returns (diff, note-about-truncation, omitted paths). Cutting the tail of
+    the whole diff would silently drop every file that sorts late in the
+    alphabet; selecting per file keeps every file reviewable or names it as
+    not reviewed.
+    """
+    total_lines = len(diff_lines(diff))
+    if total_lines <= MAX_DIFF_LINES and len(diff.encode()) <= MAX_DIFF_BYTES:
+        return diff, None, []
+
+    segments = split_segments(diff)
+    if not segments:
+        return truncate_by_position(diff)
+
+    order = sorted(range(len(segments)),
+                   key=lambda i: (segments[i]["generated"], len(segments[i]["lines"])))
+    kept: dict[int, list[str]] = {}
+    used_lines = used_bytes = 0
+    cut_tried = False
+    for i in order:
+        seg = segments[i]
+        size = sum(len(line.encode()) for line in seg["lines"])
+        if (used_lines + len(seg["lines"]) <= MAX_DIFF_LINES
+                and used_bytes + size <= MAX_DIFF_BYTES):
+            kept[i] = seg["lines"]
+            used_lines += len(seg["lines"])
+            used_bytes += size
+            continue
+
+        if cut_tried:
+            continue
+        cut_tried = True
+        room = MAX_DIFF_LINES - used_lines
+        if room >= MIN_PARTIAL_LINES:
+            reserve = len(partial_marker(seg["path"], room, len(seg["lines"])).encode())
+            head: list[str] = []
+            head_bytes = 0
+            for line in seg["lines"][:room - 1]:
+                width = len(line.encode())
+                if used_bytes + head_bytes + width + reserve > MAX_DIFF_BYTES:
+                    break
+                head_bytes += width
+                head.append(line)
+            if head:
+                if not head[-1].endswith("\n"):
+                    head[-1] += "\n"
+                marker = partial_marker(seg["path"], len(head), len(seg["lines"]))
+                kept[i] = head + [marker]
+                used_lines += len(head) + 1
+                used_bytes += head_bytes + len(marker.encode())
+
+    omitted = [seg["path"] for i, seg in enumerate(segments) if i not in kept]
+    text = "".join("".join(kept[i]) for i in sorted(kept))
+    note = (f"diff truncated: showing {len(kept)} of {len(segments)} changed files "
+            f"({len(diff_lines(text))} of {total_lines} lines)")
+    if omitted:
+        note += f"; omitted: {list_paths(omitted, NOTE_PATH_CAP)}"
+    return text, note, omitted
+
+
+def partial_marker(path: str, shown: int, total: int) -> str:
+    return f"... [{path}: showing {shown} of {total} diff lines]\n"
+
+
+def warn_note(note: str, omitted: list[str]) -> str:
+    """The prompt note with the omitted-path list cut down to what fits a terminal line."""
+    head, sep, _ = note.partition("; omitted: ")
+    return f"{head}{sep}{list_paths(omitted, WARN_PATH_CAP)}" if sep else note
 
 
 # ------------------------------------------------------------------ config
@@ -272,13 +411,32 @@ def truncate_diff(diff: str) -> tuple[str, str | None]:
 AI_LINE = re.compile(r"^ai\s+(?P<name>[A-Za-z0-9_.-]+)\s*:\s*(?P<opts>.*)$")
 
 
-def read_ai_checks(root: str) -> tuple[list[dict], list[str]]:
+def is_positive_int(value: str) -> bool:
+    return re.fullmatch(r"[0-9]+", value) is not None and int(value) > 0
+
+
+def option_problem(opts: dict) -> str | None:
+    block = opts.get("block")
+    if block is not None and block not in BLOCK_LEVELS:
+        return f"block='{block}' is not one of {', '.join(BLOCK_LEVELS)}"
+    timeout = opts.get("timeout")
+    if timeout is not None and not is_positive_int(timeout):
+        return f"timeout='{timeout}' is not a positive integer"
+    fail = opts.get("fail")
+    if fail is not None and fail not in FAIL_MODES:
+        return f"fail='{fail}' is not one of {', '.join(FAIL_MODES)}"
+    return None
+
+
+def read_ai_checks(root: str) -> tuple[list[dict], list[str], list[tuple[str, str]]]:
     """Parses the `ai <name>: k=v ...` lines out of `.turnstile`.
 
-    Returns (checks, errors). A malformed line is reported and skipped rather
-    than raised: one typo on one line must not take every other module down
-    with it, because the failure mode of that is a gate that silently reviews
-    nothing while still looking configured.
+    Returns (checks, errors, unrunnable). A malformed line is reported and
+    skipped rather than raised: one typo on one line must not take every other
+    module down with it, because the failure mode of that is a gate that
+    silently reviews nothing while still looking configured. `unrunnable`
+    names the skipped lines that asked for `fail=closed`, with the reason, so
+    the skip cannot turn a gate that refuses into one that passes.
 
     This re-implements the bash gate's config parse rather than calling it. The
     duplication is deliberate: `--staged` for a pre-commit hook has to work with
@@ -287,9 +445,9 @@ def read_ai_checks(root: str) -> tuple[list[dict], list[str]]:
     """
     path = os.path.join(root, CONFIG_NAME)
     if not os.path.isfile(path):
-        return [], []
+        return [], [], []
 
-    checks, errors = [], []
+    checks, errors, unrunnable = [], [], []
     with open(path, encoding="utf-8", errors="replace") as fh:
         for lineno, raw in enumerate(fh, 1):
             line = raw.strip()
@@ -299,7 +457,7 @@ def read_ai_checks(root: str) -> tuple[list[dict], list[str]]:
             if not m:
                 continue
 
-            opts, bad = {}, None
+            opts, problem = {}, None
             for token in m.group("opts").split():
                 # A trailing comment ends the options. Documented examples put
                 # one here (`ai review: block=never   # advisory only`), so
@@ -308,25 +466,20 @@ def read_ai_checks(root: str) -> tuple[list[dict], list[str]]:
                 if token.startswith("#"):
                     break
                 if "=" not in token:
-                    bad = f"{CONFIG_NAME}:{lineno}: expected key=value, got '{token}'"
+                    problem = f"expected key=value, got '{token}'"
                     break
                 k, v = token.split("=", 1)
                 opts[k.strip()] = v.strip()
 
-            if bad:
-                errors.append(bad)
-                continue
-
-            block = opts.get("block")
-            if block is not None and block not in BLOCK_LEVELS:
-                errors.append(
-                    f"{CONFIG_NAME}:{lineno}: block='{block}' is not one of "
-                    f"{', '.join(BLOCK_LEVELS)}"
-                )
+            problem = problem or option_problem(opts)
+            if problem:
+                errors.append(f"{CONFIG_NAME}:{lineno}: {problem}")
+                if opts.get("fail") == "closed":
+                    unrunnable.append((m.group("name"), problem))
                 continue
 
             checks.append({"name": m.group("name"), "opts": opts, "lineno": lineno})
-    return checks, errors
+    return checks, errors, unrunnable
 
 
 INTENT_LINE = re.compile(r"^intent\s*:\s*(?P<cmd>.+)$")
@@ -440,6 +593,9 @@ def load_module(name: str, root: str) -> dict:
                 raise TurnstileError(
                     f"{path}: block: '{declared}' is not one of {', '.join(BLOCK_LEVELS)}"
                 )
+            timeout = meta.get("timeout")
+            if timeout is not None and not is_positive_int(timeout):
+                raise TurnstileError(f"{path}: timeout: '{timeout}' is not a positive integer")
             return {
                 "name": name,
                 "origin": origin,
@@ -594,12 +750,12 @@ def build_prompt(diff: str, notes: list[str], intent: str | None) -> str:
     return "\n".join(parts)
 
 
-def run_module(module: dict, prompt: str, root: str,
-               model: str, use_cache: bool, timeout: int, scope: str | None = None) -> dict:
-    """Runs one module. Returns {name, findings, cached, seconds, error, scope}."""
+def run_module(module: dict, prompt: str, root: str, model: str, use_cache: bool,
+               timeout: int, scope: str | None = None, partial: bool = False) -> dict:
+    """Runs one module. Returns {name, findings, cached, seconds, error, scope, partial}."""
     started = time.time()
     result = {"name": module["name"], "findings": [], "cached": False,
-              "seconds": 0.0, "error": None, "scope": scope}
+              "seconds": 0.0, "error": None, "scope": scope, "partial": partial}
 
     key = cache_key(module, prompt, model)
     if use_cache:
@@ -720,7 +876,23 @@ def resolve_model(check: dict, module: dict, cli_model: str | None) -> str:
     )
 
 
-def render(results: list[dict], threshold_by_module: dict, root: str) -> int:
+def resolve_timeout(check: dict, module: dict, cli_timeout: int | None) -> int:
+    """Same order as resolve_model: `.turnstile` line, explicit --timeout, the
+    module's own `timeout:`, then the environment, then 600 seconds."""
+    return int(
+        check["opts"].get("timeout")
+        or cli_timeout
+        or module["meta"].get("timeout")
+        or _env_int("TURNSTILE_AI_TIMEOUT", DEFAULT_TIMEOUT)
+    )
+
+
+def one_line(reason: str) -> str:
+    return reason.split(". Searched:")[0].splitlines()[0]
+
+
+def render(results: list[dict], threshold_by_module: dict, root: str,
+           fail_closed: frozenset = frozenset()) -> int:
     """Prints the human report. Returns the count of blocking findings."""
     all_findings = []
     for r in results:
@@ -735,12 +907,18 @@ def render(results: list[dict], threshold_by_module: dict, root: str) -> int:
     for r in results:
         name = r["name"]
         if r["error"]:
-            say(f"  {C_YELLOW}?{C_RESET} ai {name} {C_DIM}({r['error']}){C_RESET}")
+            if name in fail_closed:
+                say(f"  {C_RED}✗{C_RESET} ai {name} "
+                    f"{C_DIM}(could not run: {r['error']}){C_RESET} [fail=closed]")
+            else:
+                say(f"  {C_YELLOW}?{C_RESET} ai {name} {C_DIM}({r['error']}){C_RESET}")
             continue
         n = len(r["findings"])
-        note = "cached" if r["cached"] else f"{r['seconds']:.0f}s"
-        if r.get("scope"):
-            note = f"{r['scope']}, {note}"
+        note = ", ".join(filter(None, [
+            r.get("scope"),
+            "partial review" if r.get("partial") else None,
+            "cached" if r["cached"] else f"{r['seconds']:.0f}s",
+        ]))
         mark = f"{C_GREEN}✓{C_RESET}" if n == 0 else f"{C_BLUE}•{C_RESET}"
         word = "no findings" if n == 0 else f"{n} finding{'s' if n != 1 else ''}"
         say(f"  {mark} ai {name} {C_DIM}({word}, {note}){C_RESET}")
@@ -801,8 +979,8 @@ def main(argv: list[str]) -> int:
     # "did not", so that a module's declared default is not shadowed by one.
     p.add_argument("--model", default=None,
                    help="override the model for every module this run")
-    p.add_argument("--timeout", type=int,
-                   default=int(os.environ.get("TURNSTILE_AI_TIMEOUT", "300")))
+    p.add_argument("--timeout", type=int, default=None,
+                   help="per-module timeout in seconds (default: $TURNSTILE_AI_TIMEOUT or 600)")
     p.add_argument("--no-cache", action="store_true")
     p.add_argument("--json", action="store_true", help="emit findings as JSON on stdout")
     p.add_argument("--strict", action="store_true",
@@ -831,7 +1009,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     try:
-        checks, config_errors = read_ai_checks(root)
+        checks, config_errors, unrunnable = read_ai_checks(root)
     except TurnstileError as e:
         warn(f"turnstile-ai: {e}")
         return 2 if args.strict else 0
@@ -847,11 +1025,18 @@ def main(argv: list[str]) -> int:
     # the config as much as the prompt.
     if args.module:
         checks = [{"name": name, "opts": {}, "lineno": 0} for name in args.module]
+        unrunnable = []
     elif args.only:
         checks = [c for c in checks if c["name"] in args.only]
+        unrunnable = [u for u in unrunnable if u[0] in args.only]
 
-    if not checks:
+    if not checks and not unrunnable:
         return 0
+
+    fail_closed = frozenset(
+        [c["name"] for c in checks if c["opts"].get("fail") == "closed"]
+        + [name for name, _ in unrunnable]
+    )
 
     # Resolution failures are config errors, not model errors: report every
     # one, rather than dying on the first.
@@ -876,32 +1061,38 @@ def main(argv: list[str]) -> int:
         warn(f"turnstile-ai: {err}")
     if resolve_errors and args.strict:
         return 2
+    not_run = unrunnable + [(n, e) for n, e in resolve_errors if n in fail_closed]
 
     try:
         diff, changed = diff_for(args.range_spec, args.staged, root, args.diff_file)
     except (TurnstileError, OSError) as e:
         warn(f"turnstile-ai: {e}")
+        if fail_closed:
+            warn("turnstile-ai: no diff was read, so fail=closed module(s) did not review: "
+                 + ", ".join(sorted(fail_closed)))
+            return 1
         return 2 if args.strict else 0
 
     if not diff.strip():
         return 0
 
-    diff, diff_note = truncate_diff(diff)
+    diff, diff_note, omitted = select_diff(diff)
+    warned: set[str] = set()
     if diff_note:
-        warn(f"turnstile-ai: {diff_note}")
+        warn(f"turnstile-ai: {warn_note(diff_note, omitted)}")
 
+    active = [c for c in checks if c["name"] in modules]
     intent = None
-    if not (args.module or args.diff_file):
+    if active and not (args.module or args.diff_file):
         intent_cmd = read_intent_command(root)
         if intent_cmd:
             intent = run_intent(intent_cmd, root, args.range_spec)
 
-    active = [c for c in checks if c["name"] in modules]
     models = {c["name"]: resolve_model(c, modules[c["name"]], args.model) for c in active}
     endpoints = None if args.no_cache else range_endpoints(args.range_spec, root)
 
-    def review_for(c: dict) -> tuple[str, str | None] | None:
-        """(prompt, scope label); None when nothing changed since the last pass."""
+    def review_for(c: dict) -> tuple[str, str | None, bool] | None:
+        """(prompt, scope label, partial); None when nothing changed since the last pass."""
         notes = [f"{diff_note}. Do not report on what you cannot see."] if diff_note else []
         since = None
         if endpoints:
@@ -912,14 +1103,18 @@ def main(argv: list[str]) -> int:
             if delta is not None:
                 if not delta.strip():
                     return None
-                delta, delta_note = truncate_diff(delta)
+                delta, delta_note, delta_omitted = select_diff(delta)
+                if delta_note and delta_note not in warned:
+                    warned.add(delta_note)
+                    warn(f"turnstile-ai: {warn_note(delta_note, delta_omitted)}")
                 notes = [
                     f"You already reviewed this branch up to commit {since[:12]} and "
                     "it passed. What follows is only what changed since then. "
                     "Judge it as a follow-up to work you accepted."
                 ] + ([f"{delta_note}. Do not report on what you cannot see."] if delta_note else [])
-                return build_prompt(delta, notes, intent), f"follow-up since {since[:7]}"
-        return build_prompt(diff, notes, intent), None
+                return (build_prompt(delta, notes, intent), f"follow-up since {since[:7]}",
+                        delta_note is not None)
+        return build_prompt(diff, notes, intent), None, diff_note is not None
 
     results, errored = [], False
     pending = []
@@ -927,7 +1122,8 @@ def main(argv: list[str]) -> int:
         review = review_for(c)
         if review is None:
             results.append({"name": c["name"], "findings": [], "cached": True,
-                            "seconds": 0.0, "error": None, "scope": "unchanged since pass"})
+                            "seconds": 0.0, "error": None, "scope": "unchanged since pass",
+                            "partial": False})
         else:
             pending.append((c, review))
 
@@ -938,9 +1134,10 @@ def main(argv: list[str]) -> int:
         futures = {
             pool.submit(
                 run_module, modules[c["name"]], prompt, root, models[c["name"]],
-                not args.no_cache, args.timeout, scope,
+                not args.no_cache, resolve_timeout(c, modules[c["name"]], args.timeout),
+                scope, partial,
             ): c
-            for c, (prompt, scope) in pending
+            for c, (prompt, scope, partial) in pending
         }
         for fut in concurrent.futures.as_completed(futures):
             c = futures[fut]
@@ -949,7 +1146,12 @@ def main(argv: list[str]) -> int:
             except TurnstileError as e:
                 errored = True
                 results.append({"name": c["name"], "findings": [], "cached": False,
-                                "seconds": 0.0, "error": str(e), "scope": None})
+                                "seconds": 0.0, "error": str(e), "scope": None,
+                                "partial": False})
+
+    for name, reason in not_run:
+        results.append({"name": name, "findings": [], "cached": False, "seconds": 0.0,
+                        "error": one_line(reason), "scope": None, "partial": False})
 
     results.sort(key=lambda r: r["name"])
     thresholds = {c["name"]: block_threshold(c, modules[c["name"]]) for c in active}
@@ -957,23 +1159,32 @@ def main(argv: list[str]) -> int:
     if endpoints:
         for r in results:
             t = thresholds.get(r["name"])
-            if r["error"] or any(t is not None and SEVERITY_RANK[f["severity"]] >= t
-                                 for f in r["findings"]):
+            if (r["error"] or r.get("partial")
+                    or any(t is not None and SEVERITY_RANK[f["severity"]] >= t
+                           for f in r["findings"])):
                 continue
             identity = module_identity(modules[r["name"]], models[r["name"]])
             record_pass(identity, endpoints[0], endpoints[1])
+
+    refused = [r for r in results if r["error"] and r["name"] in fail_closed]
+    truncation = None
+    if diff_note:
+        truncation = {"omitted_files": omitted, "shown_files": len(changed) - len(omitted),
+                      "total_files": len(changed), "note": diff_note}
 
     if args.json:
         json.dump(
             {
                 "range": args.range_spec or (args.diff_file and f"file:{args.diff_file}") or "staged",
                 "changed_files": changed,
+                "truncation": truncation,
                 "results": results,
                 "blocking": [
                     f for r in results for f in r["findings"]
                     if (t := thresholds.get(f["module"])) is not None
                     and SEVERITY_RANK[f["severity"]] >= t
                 ],
+                "refused": [r["name"] for r in refused],
             },
             sys.stdout, indent=2,
         )
@@ -984,9 +1195,9 @@ def main(argv: list[str]) -> int:
             and SEVERITY_RANK[f["severity"]] >= t
         )
     else:
-        blocking = render(results, thresholds, root)
+        blocking = render(results, thresholds, root, fail_closed)
 
-    if blocking:
+    if blocking or refused:
         return 1
     # A module that could not run has reviewed nothing. Default to letting the
     # push through with a visible `?` rather than refusing it: a gate that
