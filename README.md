@@ -71,8 +71,9 @@ turnstile install
 turnstile doctor
 ```
 
-The AI modules additionally need `python3` and the `claude` CLI on PATH;
-`doctor` checks for both, but only in a repo that actually configures a module.
+`turnstile files` needs `perl` on PATH, which `doctor` checks. The AI modules
+additionally need `python3` and the `claude` CLI on PATH; `doctor` checks for
+both, but only in a repo that actually configures a module.
 Symlink `bin/turnstile-ai` too if you want to call the runner directly (for a
 pre-commit hook, say) rather than through `turnstile ai`.
 
@@ -220,7 +221,7 @@ Pin it per project with a flake input, and the version lives in `flake.lock`:
 Or run it once: `nix run github:a-grasso/turnstile -- doctor`.
 
 The package puts `turnstile` and `turnstile-ai` on PATH with `bash`, `git`,
-`python3` and the coreutils they need. `turnstile install` still writes the
+`python3`, `perl` and the coreutils they need. `turnstile install` still writes the
 global `core.hooksPath`, pointing at the store path of the pinned version.
 
 ## Commands
@@ -237,6 +238,7 @@ turnstile run          run this repo's checks on the working tree, without pushi
   --no-cache           rerun checks that already passed on this tree
   --stop               what an agent's turn end runs: no ai, no push-only checks
 turnstile ci --base <ref>   CI: deterministic checks only, no cache, config read from <ref>
+turnstile files [--glob G] [-0]   changed files of the push that still exist
 turnstile ai [args]    run only the ai modules
 turnstile hook claude-stop        Claude Code Stop hook, payload on stdin
 turnstile print-claude-settings   the Stop hook block for .claude/settings.json
@@ -294,6 +296,35 @@ did not run.
 Checks get `TURNSTILE_RANGE`, `TURNSTILE_BASE`, `TURNSTILE_CHANGED_FILES` and
 `TURNSTILE_DIFF_FILE` (the change as a patch) so they can scope themselves
 further.
+
+## What a push adds
+
+A range diff answers "what differs between these two commits". A push needs a
+different answer: "what do the commits I am sending add". Merge `main` into a
+feature branch and the range diff fills with other people's work, though the
+push carries none of it.
+
+Turnstile measures a push one commit at a time. These rules fix the scope:
+
+- Commits the default branch already holds are not part of the push.
+- A new branch starts at its merge-base with the default branch, not at the
+  empty tree.
+- A merge commit counts only for what it changed against a re-merge of its
+  parents. A clean merge adds nothing.
+- A push that cannot list its commits fails. It never reads as clean.
+
+`turnstile files` prints the files the push changed that still exist at its
+tip, one per line, or NUL separated with `-0`. A file the push added and later
+deleted is not listed. `--glob` keeps the files a git pathspec glob matches and
+can repeat. In a worktree run it also lists uncommitted and untracked files.
+Checks get the mode in `TURNSTILE_MODE`, `push` or `worktree`.
+
+```
+turnstile files --glob '**/*.kt'
+```
+
+Without `TURNSTILE_MODE`, a set `TURNSTILE_RANGE` means push mode, so a script
+can run `TURNSTILE_RANGE=origin/main..HEAD turnstile files` by hand.
 
 ## The agent's loop
 
