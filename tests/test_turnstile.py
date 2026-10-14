@@ -2711,6 +2711,300 @@ class ScanAdded(unittest.TestCase):
         self.assertIn("--id", res.stderr)
 
 
+class ScanKaibo(unittest.TestCase):
+    RANGE = {"TURNSTILE_RANGE": "origin/main..HEAD"}
+    EM_DASH = "\u2014"
+
+    def page(self, root: str, rel: str, frontmatter: str, body: str) -> None:
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(f"---\n{frontmatter}\n---\n# Page\n{body}")
+
+    def block(self, checks) -> str:
+        return "\n```json kaibo-checks\n" + json.dumps(checks) + "\n```\n"
+
+    def corpus(self, r: Repo, *, malformed: bool = False) -> str:
+        root = os.path.join(r.tmp, "knowledge")
+        self.page(root, "standards/prose.md", "title: Prose\nbinding: true", self.block([
+            {"id": "no-em-dash", "kind": "forbid_regex", "pattern": "\\x{2014}"},
+            {"id": "no-disabled", "kind": "forbid_regex", "pattern": "(?m)^\\s*@Disabled\\b"},
+            {"id": "no-env-file", "kind": "forbid_path", "pattern": "\\.env$"},
+            {"id": "needs-test", "kind": "require_if_present", "pattern": "x"},
+        ]))
+        self.page(root, "notes/advice.md", "title: Advice\nbinding: false", self.block([
+            {"id": "no-todo", "kind": "forbid_regex", "pattern": "TODO"},
+        ]))
+        if malformed:
+            self.page(root, "standards/broken.md", "binding: true", "\n```json kaibo-checks\n[{oops\n```\n")
+        return root
+
+    def scan(self, r: Repo, *args: str, root: str | None = None,
+             env: dict | None = None) -> subprocess.CompletedProcess:
+        extra = {**self.RANGE, **({"TURNSTILE_KAIBO_KNOWLEDGE": root} if root else {}), **(env or {})}
+        return subprocess.run([TURNSTILE, "scan", "added", *args], cwd=r.root,
+                              env={**r.env, **extra}, capture_output=True, text=True)
+
+    def feature(self, r: Repo, rel: str, content: str) -> None:
+        r.git("switch", "-q", "-c", "feature")
+        r.write(rel, content)
+        r.commit_all("add")
+
+    def test_an_added_line_a_binding_forbid_regex_matches_is_refused(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.feature(r, "docs/x.md", f"ok\nwritten {self.EM_DASH} here\n")
+        sha = r.git("rev-parse", "--short=7", "HEAD").strip()
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn(f"  x no-em-dash: docs/x.md:2 ({sha})", res.stdout)
+
+    def test_a_multiline_flagged_pattern_from_the_corpus_compiles_and_fires(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.feature(r, "T.java", "class T {\n    @Disabled\n}\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("no-disabled: T.java:2", res.stdout)
+
+    def test_a_page_that_is_not_binding_does_not_load(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.feature(r, "x.md", "TODO later\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_other_check_kinds_are_skipped(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.feature(r, "x.env", "a\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_a_malformed_binding_page_fails_closed_naming_the_page(self):
+        r = Repo(self)
+        root = self.corpus(r, malformed=True)
+        self.feature(r, "x.md", "fine\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("broken.md", res.stderr)
+
+    def test_a_check_without_an_id_or_pattern_fails_closed_naming_the_page(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.page(root, "standards/partial.md", "binding: true",
+                  self.block([{"kind": "forbid_regex", "pattern": "x"}]))
+        self.feature(r, "x.md", "fine\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("partial.md", res.stderr)
+
+    def test_a_missing_corpus_names_the_variable_and_the_sync_command(self):
+        r = Repo(self)
+        self.feature(r, "x.md", "fine\n")
+
+        res = self.scan(r, "--kaibo-checks", root=os.path.join(r.tmp, "absent"))
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("TURNSTILE_KAIBO_KNOWLEDGE", res.stderr)
+        self.assertIn("kaibo sync", res.stderr)
+
+    def test_the_corpus_defaults_to_the_kaibo_directory_under_home(self):
+        r = Repo(self)
+        home = os.path.join(r.tmp, "home")
+        self.corpus(r)
+        os.makedirs(os.path.join(home, ".kaibo"))
+        os.rename(os.path.join(r.tmp, "knowledge"), os.path.join(home, ".kaibo", "knowledge"))
+        self.feature(r, "x.md", f"a {self.EM_DASH} b\n")
+
+        res = self.scan(r, "--kaibo-checks", env={"HOME": home})
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("no-em-dash: x.md:1", res.stdout)
+
+    def test_kaibo_checks_alone_is_a_pattern_source(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.feature(r, "x.md", "fine\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("pattern source", res.stderr)
+
+    def test_it_combines_with_forbid_in_one_run(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.feature(r, "x.md", f"a {self.EM_DASH} b\nFIXME\n")
+
+        res = self.scan(r, "--forbid", "FIXME", "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("no-em-dash: x.md:1", res.stdout)
+        self.assertIn("forbid: x.md:2", res.stdout)
+
+    def test_a_kaibo_id_colliding_with_a_user_id_is_refused(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.feature(r, "x.md", "fine\n")
+
+        res = self.scan(r, "--forbid", "FIXME", "--id", "no-em-dash", "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("duplicate pattern id: no-em-dash", res.stderr)
+        self.assertIn("kaibo page", res.stderr)
+        self.assertIn("prose.md", res.stderr)
+
+    def test_a_kaibo_id_colliding_with_a_builtin_secret_id_is_refused(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.page(root, "standards/clash.md", "binding: true",
+                  self.block([{"id": "aws-access-key", "kind": "forbid_regex", "pattern": "x"}]))
+        self.feature(r, "x.md", "fine\n")
+
+        res = self.scan(r, "--forbid-secrets", "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("duplicate pattern id: aws-access-key", res.stderr)
+        self.assertIn("clash.md", res.stderr)
+
+    def test_two_kaibo_pages_sharing_an_id_are_refused_naming_both(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.page(root, "standards/second.md", "binding: true",
+                  self.block([{"id": "no-em-dash", "kind": "forbid_regex", "pattern": "x"}]))
+        self.feature(r, "x.md", "fine\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("no-em-dash", res.stderr)
+        self.assertIn("prose.md", res.stderr)
+        self.assertIn("second.md", res.stderr)
+
+    def test_tolerant_binding_spellings_load_the_page(self):
+        spellings = ['binding: "true"', "binding : True", "binding:   'true'  # reviewed", "binding: TRUE"]
+        for spelling in spellings:
+            with self.subTest(spelling=spelling):
+                r = Repo(self)
+                root = os.path.join(r.tmp, "knowledge")
+                self.page(root, "p.md", f"title: P\n{spelling}", self.block(
+                    [{"id": "no-fixme", "kind": "forbid_regex", "pattern": "FIXME"}]))
+                self.feature(r, "x.md", "FIXME\n")
+
+                res = self.scan(r, "--kaibo-checks", root=root)
+
+                self.assertEqual(res.returncode, 1, res.stderr)
+                self.assertIn("no-fixme: x.md:1", res.stdout)
+
+    def test_a_byte_order_mark_before_the_frontmatter_is_tolerated(self):
+        r = Repo(self)
+        root = os.path.join(r.tmp, "knowledge")
+        os.makedirs(root)
+        with open(os.path.join(root, "p.md"), "w", encoding="utf-8-sig") as fh:
+            fh.write("---\nbinding: true\n---\n" + self.block(
+                [{"id": "no-fixme", "kind": "forbid_regex", "pattern": "FIXME"}]))
+        self.feature(r, "x.md", "FIXME\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+
+    def test_an_unrecognised_binding_value_fails_closed_naming_the_page(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.page(root, "standards/odd.md", "binding: maybe", self.block(
+            [{"id": "no-fixme", "kind": "forbid_regex", "pattern": "FIXME"}]))
+        self.feature(r, "x.md", "fine\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("odd.md", res.stderr)
+
+    def test_binding_false_is_not_binding(self):
+        r = Repo(self)
+        root = os.path.join(r.tmp, "knowledge")
+        self.page(root, "p.md", 'binding: "false"', self.block(
+            [{"id": "no-fixme", "kind": "forbid_regex", "pattern": "FIXME"}]))
+        self.page(root, "q.md", "binding: true", self.block(
+            [{"id": "no-todo", "kind": "forbid_regex", "pattern": "TODO"}]))
+        self.feature(r, "x.md", "FIXME\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_a_corpus_that_yields_no_checks_is_not_a_clean_scan(self):
+        r = Repo(self)
+        root = os.path.join(r.tmp, "knowledge")
+        self.page(root, "notes/advice.md", "binding: false", self.block(
+            [{"id": "no-todo", "kind": "forbid_regex", "pattern": "TODO"}]))
+        self.feature(r, "x.md", "fine\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("no kaibo checks", res.stderr)
+        self.assertIn(root, res.stderr)
+
+    def test_dot_directories_are_not_walked(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.page(root, ".obsidian/p.md", "binding: true", self.block(
+            [{"id": "no-fixme", "kind": "forbid_regex", "pattern": "FIXME"}]))
+        self.feature(r, "x.md", "FIXME\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_a_pattern_that_does_not_compile_exits_two_naming_its_id(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.page(root, "standards/py.md", "binding: true", self.block(
+            [{"id": "python-only", "kind": "forbid_regex", "pattern": "(unclosed"}]))
+        self.feature(r, "x.md", "a\n")
+
+        res = self.scan(r, "--kaibo-checks", root=root)
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("python-only", res.stderr)
+
+    def test_without_python3_it_exits_two_naming_it(self):
+        r = Repo(self)
+        root = self.corpus(r)
+        self.feature(r, "x.md", "fine\n")
+        bare = os.path.join(r.tmp, "no-python-bin")
+        os.makedirs(bare)
+        for name in ("git", "perl", "dirname", "env", "sed", "grep", "cat", "tr", "cut", "sort", "head",
+                     "tail", "mktemp", "rm", "wc", "awk", "date", "sha1sum", "shasum", "uname", "cksum"):
+            found = shutil.which(name)
+            if found:
+                os.symlink(found, os.path.join(bare, name))
+
+        res = subprocess.run([shutil.which("bash"), TURNSTILE, "scan", "added", "--kaibo-checks"],
+                             cwd=r.root, capture_output=True, text=True,
+                             env={**r.env, **self.RANGE, "TURNSTILE_KAIBO_KNOWLEDGE": root, "PATH": bare})
+
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("python3 is not on PATH", res.stderr)
+
+
 class ScanPaths(unittest.TestCase):
     RANGE = {"TURNSTILE_RANGE": "origin/main..HEAD"}
 

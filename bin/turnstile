@@ -839,6 +839,10 @@ require_perl() {
   command -v perl >/dev/null 2>&1 || scope_fail "perl is not on PATH, which turnstile files and the diff scan need"
 }
 
+require_python3() {
+  command -v python3 >/dev/null 2>&1 || scope_fail "python3 is not on PATH, which scan added --kaibo-checks needs"
+}
+
 # The missing-config warning needs the remote's own default branch, so the local fallback lives here.
 scope_default_ref() {
   local ref
@@ -1223,13 +1227,104 @@ scan_added_run() {
 }
 
 scan_claim_id() {
-  case "$claimed" in *"|$1|"*) scope_fail "scan added: duplicate pattern id: $1" ;; esac
+  case "$claimed" in *"|$1|"*) scope_fail "scan added: duplicate pattern id: $1${2:+ (from kaibo page $2)}" ;; esac
   claimed="$claimed$1|"
+}
+
+# Fails closed: a page that binds but cannot be read must stop the scan, never shrink it.
+kaibo_forbid_patterns() {
+  local root="${TURNSTILE_KAIBO_KNOWLEDGE:-${HOME:-}/.kaibo/knowledge}"
+  [ -d "$root" ] \
+    || scope_fail "scan added: no kaibo knowledge corpus at $root; set TURNSTILE_KAIBO_KNOWLEDGE or run kaibo sync"
+  python3 - "$root" <<'PY'
+import json
+import os
+import re
+import sys
+
+FENCE = "```json kaibo-checks"
+BINDING = re.compile(r"""^binding\s*:\s*(?:"([^"]*)"|'([^']*)'|([^#\s]*))\s*(?:#.*)?$""")
+
+
+def fail(page, why):
+    sys.stderr.write(f"x scan added: {page}: {why}\n")
+    sys.exit(2)
+
+
+def binding(page, lines):
+    """Reads the frontmatter off the line iterator; the body is left unread."""
+    if next(lines, "").strip() != "---":
+        return False
+    result = False
+    for line in lines:
+        if line.strip() == "---":
+            return result
+        match = BINDING.match(line.rstrip())
+        if not match:
+            continue
+        value = next(g for g in match.groups() if g is not None).strip().lower()
+        if value not in ("true", "false"):
+            fail(page, f"unrecognised binding value {value!r}")
+        result = value == "true"
+    return False
+
+
+def blocks(page, lines):
+    body = None
+    for line in lines:
+        if body is None:
+            if line.strip() == FENCE:
+                body = []
+        elif line.strip() == "```":
+            yield "\n".join(body)
+            body = None
+        else:
+            body.append(line)
+    if body is not None:
+        fail(page, "unterminated kaibo-checks block")
+
+
+root = sys.argv[1]
+out = []
+owner = {}
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+    for name in sorted(filenames):
+        if not name.endswith(".md"):
+            continue
+        page = os.path.join(dirpath, name)
+        with open(page, encoding="utf-8-sig", errors="replace") as fh:
+            lines = (line.rstrip("\r\n") for line in fh)
+            if not binding(page, lines):
+                continue
+            for text in blocks(page, lines):
+                try:
+                    checks = json.loads(text)
+                except ValueError as err:
+                    fail(page, f"malformed kaibo-checks JSON ({err})")
+                if not isinstance(checks, list):
+                    fail(page, "kaibo-checks is not a JSON array")
+                for check in checks:
+                    if not isinstance(check, dict):
+                        fail(page, "kaibo-checks entry is not an object")
+                    if check.get("kind") != "forbid_regex":
+                        continue
+                    cid, pattern = check.get("id"), check.get("pattern")
+                    if not (isinstance(cid, str) and cid and isinstance(pattern, str) and pattern):
+                        fail(page, "forbid_regex check needs a non-empty id and pattern")
+                    if cid in owner:
+                        fail(page, f"duplicate pattern id {cid} (also in {owner[cid]})")
+                    owner[cid] = page
+                    out.append(f"{cid}\x1f{pattern}\x1f{page}\x1e")
+if not out:
+    fail(root, "no kaibo checks found (no binding page carries a forbid_regex check); run kaibo sync")
+sys.stdout.buffer.write("".join(out).encode("utf-8"))
+PY
 }
 
 cmd_scan_added() {
   require_perl
-  local since_base="" secrets="" id records="" entry i claimed="|"
+  local since_base="" secrets="" kaibo="" id records="" entry i claimed="|" kaibo_records record page
   local -a ids=() sources=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1245,14 +1340,15 @@ cmd_scan_added() {
         [ "${#ids[@]}" -gt 0 ] || scope_fail "scan added: --id names the --forbid before it"
         ids[${#ids[@]}-1]="$id" ;;
       --forbid-secrets) secrets=1 ;;
+      --kaibo-checks)   kaibo=1 ;;
       --since-base)     since_base=1 ;;
       -h|--help)        usage; return 0 ;;
       *)                scope_fail "unknown option for scan added: $1" ;;
     esac
     shift
   done
-  [ "${#sources[@]}" -gt 0 ] || [ -n "$secrets" ] \
-    || scope_fail "scan added needs a pattern source: --forbid REGEX or --forbid-secrets"
+  [ "${#sources[@]}" -gt 0 ] || [ -n "$secrets" ] || [ -n "$kaibo" ] \
+    || scope_fail "scan added needs a pattern source: --forbid REGEX, --forbid-secrets or --kaibo-checks"
 
   for ((i = 0; i < ${#sources[@]}; i++)); do
     id="${ids[$i]}"
@@ -1265,6 +1361,16 @@ cmd_scan_added() {
       scan_claim_id "${entry%%:*}"
       records="$records${entry%%:*}"$'\037'"${entry#*:}"$'\036'
     done
+  fi
+  if [ -n "$kaibo" ]; then
+    require_python3
+    kaibo_records="$(kaibo_forbid_patterns)" || exit 2
+    while IFS= read -r -d $'\036' record; do
+      page="${record##*$'\037'}"
+      record="${record%$'\037'*}"
+      scan_claim_id "${record%%$'\037'*}" "$page"
+      records="$records$record"$'\036'
+    done <<<"$kaibo_records"
   fi
   export TS_PATTERNS="$records"
 
@@ -1676,6 +1782,13 @@ cmd_doctor() {
     problems=$((problems + 1))
   fi
 
+  if command -v python3 >/dev/null 2>&1; then
+    say "  ${C_GREEN}✓${C_RESET} python3 on PATH"
+  else
+    say "  ${C_RED}✗${C_RESET} python3 not on PATH - the ai runner and scan added --kaibo-checks cannot run"
+    problems=$((problems + 1))
+  fi
+
   # The AI half is only a problem when a repo actually asked for it. A machine
   # that only ever runs deterministic checks should not be told it is broken
   # for lacking a `claude` binary it will never invoke.
@@ -1691,12 +1804,6 @@ cmd_doctor() {
       say "  ${C_GREEN}✓${C_RESET} claude CLI on PATH"
     else
       say "  ${C_RED}✗${C_RESET} claude CLI not on PATH - ai modules will be skipped"
-      problems=$((problems + 1))
-    fi
-    if command -v python3 >/dev/null 2>&1; then
-      say "  ${C_GREEN}✓${C_RESET} python3 on PATH"
-    else
-      say "  ${C_RED}✗${C_RESET} python3 not on PATH - ai runner cannot start"
       problems=$((problems + 1))
     fi
   fi
@@ -1729,6 +1836,7 @@ usage() {
     turnstile files [--glob G] [-0]   changed files of the push that still exist
     turnstile scan added --forbid REGEX [--since-base]   refuse added lines matching REGEX (PCRE)
     turnstile scan added --forbid-secrets                builtin secret patterns, per pushed commit
+    turnstile scan added --kaibo-checks                  kaibo binding forbid_regex checks over added lines
     turnstile scan paths --forbid-gitignored        refuse pushed paths the tracked .gitignore ignores
     turnstile ai [args]    run just the ai modules (see: turnstile ai --help)
     turnstile hook claude-stop
