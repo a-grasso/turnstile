@@ -241,6 +241,7 @@ turnstile ci --base <ref>   CI: deterministic checks only, no cache, config read
 turnstile files [--glob G] [-0]   changed files of the push that still exist
 turnstile scan added --forbid REGEX [--since-base]   refuse added lines matching REGEX (PCRE)
 turnstile scan added --forbid-secrets                builtin secret patterns, per pushed commit
+turnstile scan paths --forbid-gitignored             refuse pushed paths the tracked .gitignore ignores
 turnstile ai [args]    run only the ai modules
 turnstile hook claude-stop        Claude Code Stop hook, payload on stdin
 turnstile print-claude-settings   the Stop hook block for .claude/settings.json
@@ -361,6 +362,28 @@ turnstile scan added --forbid '\x{2014}' --since-base
 
 The first line is a secrets check. The second keeps an em dash out of new
 prose. Put either command after a check name in `.turnstile`.
+
+### Refusing ignored paths
+
+`turnstile scan paths --forbid-gitignored` fails when a pushed commit adds or
+renames in a path that the repo's `.gitignore` ignores. It catches a
+force-added local-only file such as a `data/` export or a `.env`. The scope is
+the same as for `files`, and each commit is judged on its own, so a path added
+in one commit and untracked in the next is still refused. A worktree run also
+checks files staged for commit.
+
+Only tracked `.gitignore` files count. A pattern in `.git/info/exclude`, in a
+global excludes file or in an untracked excludes file stays personal and never
+trips the scan. Ignore rules are read from the checkout, which during a real
+push is the pushed tree, so a manual run with `TURNSTILE_RANGE` from another
+branch is best-effort. A pushed path that git cannot judge, such as one behind
+a symlink, is skipped with a warning and the scan goes on. A finding reads
+`  x gitignored: path (context)` with the commit or `uncommitted`, followed by a
+count. The exit status follows the same contract as `scan added`.
+
+```
+turnstile scan paths --forbid-gitignored
+```
 
 ## The agent's loop
 
