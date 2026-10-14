@@ -939,6 +939,7 @@ for my $record (split /\x1e/, $ENV{TS_PATTERNS} // '') {
     next if $record eq '';
     my ($id, $source) = split /\x1f/, $record, 2;
     my $regex;
+    utf8::decode($source) if defined $source;
     $regex = eval { qr/$source/ } if defined $source && length $source;
     if (!$regex) {
         print STDERR "bad pattern $id\n";
@@ -952,6 +953,7 @@ my $found = 0;
 
 sub report {
     my ($path, $line_no, $text) = @_;
+    utf8::decode($text);
     for my $pattern (@patterns) {
         my ($id, $regex) = @$pattern;
         next unless $text =~ $regex;
@@ -991,8 +993,15 @@ sub git_header_path {
 
 if ($ENV{TS_PLAIN}) {
     my $path = $ENV{TS_PATH} // '';
-    while (my $line = <STDIN>) {
+    exit 0 if ((stat STDIN)[7] // 0) > 10 * 1024 * 1024;
+    my $head = '';
+    read(STDIN, $head, 8192);
+    exit 0 if $head =~ /\0/;
+    my $data = $head . (do { local $/; <STDIN> } // '');
+    open(my $fh, '<', \$data) or exit 2;
+    while (my $line = <$fh>) {
         chomp $line;
+        $line =~ s/\r\z//;
         report($path, $., $line);
     }
     exit $found;
@@ -1002,6 +1011,13 @@ my ($file, $line_no, $columns, $in_hunk, $old_left, $new_left) = (undef, 0, 0, 0
 
 while (my $line = <STDIN>) {
     chomp $line;
+    $line =~ s/\r\z//;
+
+    if ($line =~ /\Aturnstile-commit: (\S+)\z/) {
+        $context = substr($1, 0, 7);
+        ($file, $in_hunk) = (undef, 0);
+        next;
+    }
 
     if ($line =~ /\A(@@+) (.*?) \1/) {
         my ($marks, $ranges) = ($1, $2);
@@ -1061,16 +1077,35 @@ scan_match() {
   perl -e "$SCAN_MATCH_PERL"
 }
 
+# Runs the producer into the matcher. 0 clean, 1 findings, 2 cannot scan: the matcher's own verdict
+# stands unless the producer failed, and a matcher that quit early (bad pattern) outranks the SIGPIPE it caused.
+scan_through() {
+  local -a status
+  "$@" | scan_match
+  status=("${PIPESTATUS[@]}")
+  [ "${status[1]}" -ne 2 ] && [ "${status[0]}" -eq 0 ] || return 2
+  return "${status[1]}"
+}
+
+SECRET_PATTERNS=(
+  'private-key:-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----'
+  'aws-access-key:\bAKIA[0-9A-Z]{16}\b'
+  'github-token:\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}'
+  'gitlab-pat:\bglpat-[A-Za-z0-9_-]{20,}'
+  'atlassian-token:\bATATT[A-Za-z0-9_\-=]{20,}'
+  'slack-token:\bxox[abprs]-[A-Za-z0-9-]{10,}'
+  'generic-sk-key:(?<!\w)sk-[A-Za-z0-9_-]{16,}'
+)
+readonly SECRET_PATTERNS
+
 # A push leaves the machine as committed, so only a worktree run has these.
 scan_worktree_extras() {
   [ "$SCOPE_MODE" = worktree ] || return 0
   local rc=0 path list
-  local -a status
 
-  git -c core.quotePath=false diff -U0 "${SCAN_DIFF_OPTS[@]}" HEAD | TS_CONTEXT=uncommitted scan_match
-  status=("${PIPESTATUS[@]}")
-  [ "${status[0]}" -eq 0 ] || return 2
-  case "${status[1]}" in 0) ;; 1) rc=1 ;; *) return 2 ;; esac
+  TS_CONTEXT=uncommitted scan_through git -c core.quotePath=false diff -U0 "${SCAN_DIFF_OPTS[@]}" HEAD
+  rc=$?
+  [ "$rc" -lt 2 ] || return 2
 
   list="$(mktemp "${TMPDIR:-/tmp}/turnstile-untracked.XXXXXX")" || return 2
   if ! git -c core.quotePath=false ls-files --others --exclude-standard -z >"$list"; then
@@ -1146,6 +1181,109 @@ cmd_files() {
   rc=$?
   rm -f "$raw"
   [ "$rc" -eq 0 ] || exit 2
+}
+
+# One matcher reads every commit's diff, each introduced by a separator line that carries its sha.
+commit_diff_stream() {
+  local sha parents
+  while read -r sha parents; do
+    [ -n "$sha" ] || continue
+    printf 'turnstile-commit: %s\n' "$sha"
+    commit_scan_diff "$sha" "$parents" || return 1
+  done <<<"$1"
+}
+
+# Prints the findings; returns 0 clean, 1 findings, 2 cannot scan.
+scan_added_run() {
+  local since_base="$1" rc=0 extras commits base default
+
+  if [ -n "$since_base" ]; then
+    default="$(scope_default_ref)" \
+      || scope_fail "--since-base needs a default branch ref (origin/main, origin/master, main or master)"
+    base="$(git merge-base "$default" "$SCOPE_TIP")" || scope_fail "no merge base of $default and the push tip"
+    TS_CONTEXT=since-base scan_through git -c core.quotePath=false diff -U0 "${SCAN_DIFF_OPTS[@]}" "$base" "$SCOPE_TIP"
+  else
+    commits="$(pushed_commits)" || return 2
+    scan_through commit_diff_stream "$commits"
+  fi
+  rc=$?
+  [ "$rc" -lt 2 ] || return 2
+
+  scan_worktree_extras
+  extras=$?
+  [ "$extras" -lt 2 ] || return 2
+  [ "$extras" -le "$rc" ] || rc=$extras
+  return $rc
+}
+
+scan_claim_id() {
+  case "$claimed" in *"|$1|"*) scope_fail "scan added: duplicate pattern id: $1" ;; esac
+  claimed="$claimed$1|"
+}
+
+cmd_scan_added() {
+  require_perl
+  local since_base="" secrets="" id records="" entry i claimed="|"
+  local -a ids=() sources=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --forbid)
+        [ -n "${2:-}" ] || scope_fail "scan added needs a pattern after --forbid"
+        sources+=("$2"); ids+=(""); shift ;;
+      --forbid=*)
+        [ -n "${1#--forbid=}" ] || scope_fail "scan added needs a pattern after --forbid"
+        sources+=("${1#--forbid=}"); ids+=("") ;;
+      --id|--id=*)
+        if [ "$1" = --id ]; then id="${2:-}"; shift; else id="${1#--id=}"; fi
+        [ -n "$id" ] || scope_fail "scan added needs a name after --id"
+        [ "${#ids[@]}" -gt 0 ] || scope_fail "scan added: --id names the --forbid before it"
+        ids[${#ids[@]}-1]="$id" ;;
+      --forbid-secrets) secrets=1 ;;
+      --since-base)     since_base=1 ;;
+      -h|--help)        usage; return 0 ;;
+      *)                scope_fail "unknown option for scan added: $1" ;;
+    esac
+    shift
+  done
+  [ "${#sources[@]}" -gt 0 ] || [ -n "$secrets" ] \
+    || scope_fail "scan added needs a pattern source: --forbid REGEX or --forbid-secrets"
+
+  for ((i = 0; i < ${#sources[@]}; i++)); do
+    id="${ids[$i]}"
+    [ -n "$id" ] || { [ "$i" -eq 0 ] && id=forbid || id="forbid$((i + 1))"; }
+    scan_claim_id "$id"
+    records="$records$id"$'\037'"${sources[$i]}"$'\036'
+  done
+  if [ -n "$secrets" ]; then
+    for entry in "${SECRET_PATTERNS[@]}"; do
+      scan_claim_id "${entry%%:*}"
+      records="$records${entry%%:*}"$'\037'"${entry#*:}"$'\036'
+    done
+  fi
+  export TS_PATTERNS="$records"
+
+  local root; root="$(repo_root)" || scope_fail "not inside a git repository"
+  cd "$root" || exit 2
+  scope_resolve
+
+  local found rc
+  found="$(scan_added_run "$since_base")"
+  rc=$?
+  [ -z "$found" ] || printf '%s\n' "$found"
+  case $rc in
+    0) return 0 ;;
+    1) printf 'scan: %s forbidden line(s) added\n' "$(printf '%s\n' "$found" | grep -c '^  x ')"; return 1 ;;
+    *) exit 2 ;;
+  esac
+}
+
+cmd_scan() {
+  case "${1:-}" in
+    added)     shift; cmd_scan_added "$@" ;;
+    -h|--help) usage; return 0 ;;
+    "")        scope_fail "scan needs a subcommand: added" ;;
+    *)         scope_fail "unknown scan subcommand: $1" ;;
+  esac
 }
 
 # The working tree as one hash, untracked files included. For the Stop hook,
@@ -1448,6 +1586,8 @@ usage() {
     turnstile ci --base <ref>
                            CI: deterministic checks only, no cache, config read from <ref>
     turnstile files [--glob G] [-0]   changed files of the push that still exist
+    turnstile scan added --forbid REGEX [--since-base]   refuse added lines matching REGEX (PCRE)
+    turnstile scan added --forbid-secrets                builtin secret patterns, per pushed commit
     turnstile ai [args]    run just the ai modules (see: turnstile ai --help)
     turnstile hook claude-stop
                            Claude Code Stop hook: reads the payload on stdin
@@ -1480,6 +1620,7 @@ case "${1:-}" in
   run)         shift; cmd_run "$@" ;;
   ci)          shift; cmd_ci "$@" ;;
   files)       shift; cmd_files "$@" ;;
+  scan)        shift; cmd_scan "$@" ;;
   # Internal: they make the matcher and the worktree scan testable on their own.
   __scan-match) scan_match ;;
   __scan-worktree) cd "$(repo_root)" && scope_resolve && scan_worktree_extras ;;
