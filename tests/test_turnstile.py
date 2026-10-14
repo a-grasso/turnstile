@@ -179,6 +179,36 @@ class ScopedChecks(unittest.TestCase):
             changed = set(fh.read().split())
         self.assertTrue({"a.txt", "lib/new.txt"} <= changed, changed)
 
+    def test_changed_files_name_non_ascii_paths_as_they_are_on_disk(self):
+        r = Repo(self)
+        out = os.path.join(r.tmp, "changed")
+        r.config(f'all: printf "%s" "$TURNSTILE_CHANGED_FILES" > {out}\n')
+        r.write("data/Kundenliste_M\u00fcller.csv", "x\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(out) as fh:
+            changed = fh.read()
+        self.assertIn("data/Kundenliste_M\u00fcller.csv", changed.split("\n"))
+        self.assertNotIn("\\", changed)
+
+    def test_pushed_changed_files_name_non_ascii_paths_as_they_are_on_disk(self):
+        r = Repo(self)
+        out = os.path.join(r.tmp, "changed")
+        r.config(f'all: printf "%s" "$TURNSTILE_CHANGED_FILES" > {out}\n')
+        r.commit_all("config")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.write("data/Kundenliste_M\u00fcller.csv", "x\n")
+        r.commit_all("umlaut")
+
+        res = r.pre_push()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(out) as fh:
+            changed = fh.read()
+        self.assertEqual(changed.split("\n"), ["data/Kundenliste_M\u00fcller.csv"])
+
     def test_diff_file_carries_the_change_under_review(self):
         r = Repo(self)
         r.config('no-skip: test -f "$TURNSTILE_DIFF_FILE" && ! grep -q "^+.*SKIPPED" "$TURNSTILE_DIFF_FILE"\n')
@@ -263,6 +293,75 @@ class NewBranchBase(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         with open(seen) as fh:
             self.assertEqual(fh.read().split(), ["feature.txt"])
+
+    def test_pushing_a_commit_the_remote_already_has_to_a_new_name_checks_an_empty_change(self):
+        r = Repo(self)
+        seen = os.path.join(r.tmp, "seen")
+        r.config(f'probe: printf "%s" "$TURNSTILE_CHANGED_FILES" > {seen}\n')
+        r.commit_all("config")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+
+        head = r.git("rev-parse", "HEAD").strip()
+        zero = "0" * 40
+        res = r.turnstile("__pre-push", "origin",
+                          stdin=f"refs/heads/copy {head} refs/heads/copy {zero}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(seen) as fh:
+            self.assertEqual(fh.read(), "")
+
+    def test_a_commit_only_a_non_default_remote_branch_holds_is_still_checked(self):
+        r = Repo(self)
+        seen = os.path.join(r.tmp, "seen")
+        r.config(f'probe: printf "%s" "$TURNSTILE_CHANGED_FILES" > {seen}\n')
+        r.commit_all("config")
+        r.git("push", "-q", "origin", "HEAD:refs/heads/wip", "--no-verify")
+        r.git("update-ref", "-d", "refs/remotes/origin/main")
+
+        head = r.git("rev-parse", "HEAD").strip()
+        zero = "0" * 40
+        res = r.turnstile("__pre-push", "origin",
+                          stdin=f"refs/heads/copy {head} refs/heads/copy {zero}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(seen) as fh:
+            self.assertTrue({"a.txt", "lib/b.txt"} <= set(fh.read().split()))
+
+    def test_the_first_push_into_an_empty_remote_is_diffed_against_the_empty_tree(self):
+        r = Repo(self)
+        seen = os.path.join(r.tmp, "seen")
+        r.config(f'probe: printf "%s" "$TURNSTILE_CHANGED_FILES" > {seen}\n')
+        r.commit_all("config")
+        r.git("update-ref", "-d", "refs/remotes/origin/main")
+
+        head = r.git("rev-parse", "HEAD").strip()
+        zero = "0" * 40
+        res = r.turnstile("__pre-push", "origin",
+                          stdin=f"refs/heads/main {head} refs/heads/main {zero}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(seen) as fh:
+            self.assertTrue({"a.txt", "lib/b.txt", ".turnstile"} <= set(fh.read().split()))
+
+    def test_a_branch_unrelated_to_the_remote_is_diffed_against_the_empty_tree(self):
+        r = Repo(self)
+        seen = os.path.join(r.tmp, "seen")
+        r.config(f'probe: printf "%s" "$TURNSTILE_CHANGED_FILES" > {seen}\n')
+        r.commit_all("config")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "--orphan", "fresh")
+        r.config(f'probe: printf "%s" "$TURNSTILE_CHANGED_FILES" > {seen}\n')
+        r.write("fresh.txt", "unrelated history\n")
+        r.commit_all("fresh")
+
+        head = r.git("rev-parse", "HEAD").strip()
+        zero = "0" * 40
+        res = r.turnstile("__pre-push", "origin",
+                          stdin=f"refs/heads/fresh {head} refs/heads/fresh {zero}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(seen) as fh:
+            self.assertEqual(set(fh.read().split()), {".turnstile", "fresh.txt"})
 
 
 class PassCache(unittest.TestCase):
@@ -1541,6 +1640,145 @@ class RepoHook(unittest.TestCase):
         self.assertEqual(r.runs(), 0)
 
 
+class OptionHandling(unittest.TestCase):
+    def setUp(self):
+        r = self.r = Repo(self)
+        r.env["TURNSTILE_HOOKS_DIR"] = os.path.join(r.tmp, "global-hooks")
+
+    def global_hooks_path(self) -> str:
+        res = subprocess.run(["git", "config", "--global", "--get", "core.hooksPath"],
+                             env=self.r.env, capture_output=True, text=True)
+        return res.stdout.strip()
+
+    def test_install_help_prints_usage_and_leaves_the_global_config_alone(self):
+        res = self.r.turnstile("install", "--help")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Usage", res.stderr)
+        self.assertEqual(self.global_hooks_path(), "")
+        self.assertFalse(os.path.exists(self.r.env["TURNSTILE_HOOKS_DIR"]))
+
+    def test_install_rejects_an_unknown_option_without_installing(self):
+        res = self.r.turnstile("install", "--bogus")
+
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("unknown option for install: --bogus", res.stderr)
+        self.assertEqual(self.global_hooks_path(), "")
+        self.assertFalse(os.path.exists(self.r.env["TURNSTILE_HOOKS_DIR"]))
+
+    def test_uninstall_help_prints_usage_and_leaves_the_global_config_alone(self):
+        installed = self.r.turnstile("install")
+        res = self.r.turnstile("uninstall", "-h")
+
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Usage", res.stderr)
+        self.assertEqual(self.global_hooks_path(), self.r.env["TURNSTILE_HOOKS_DIR"])
+        self.assertTrue(os.path.isdir(self.r.env["TURNSTILE_HOOKS_DIR"]))
+
+    def test_uninstall_rejects_an_unknown_option_without_uninstalling(self):
+        self.r.turnstile("install")
+        res = self.r.turnstile("uninstall", "--bogus")
+
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("unknown option for uninstall: --bogus", res.stderr)
+        self.assertEqual(self.global_hooks_path(), self.r.env["TURNSTILE_HOOKS_DIR"])
+        self.assertTrue(os.path.isdir(self.r.env["TURNSTILE_HOOKS_DIR"]))
+
+    def test_run_help_works_outside_a_repository(self):
+        outside = os.path.join(self.r.tmp, "outside")
+        os.makedirs(outside)
+
+        res = subprocess.run([TURNSTILE, "run", "--help"], cwd=outside, env=self.r.env,
+                             capture_output=True, text=True)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Usage", res.stderr)
+
+    def test_run_help_works_in_a_repository_with_an_unapproved_config(self):
+        self.r.config("lint: true\n", allow=False)
+
+        res = self.r.turnstile("run", "--help")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Usage", res.stderr)
+
+    def test_run_and_ci_print_usage_for_help(self):
+        for command in ("run", "ci"):
+            with self.subTest(command=command):
+                res = self.r.turnstile(command, "--help")
+
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertIn("Usage", res.stderr)
+
+
+class MissingConfigWarning(unittest.TestCase):
+    WARNING = "tracks a .turnstile this push does not carry - its checks did not run"
+
+    def tracked_config(self) -> Repo:
+        r = Repo(self)
+        r.config("lint: false\n")
+        r.commit_all("config")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        return r
+
+    def orphan(self, r: Repo, name: str) -> str:
+        r.git("switch", "-q", "--orphan", name)
+        r.write(f"{name}.txt", "no gate here\n")
+        r.commit_all(name)
+        return r.git("rev-parse", "HEAD").strip()
+
+    def test_warns_when_the_default_branch_tracks_a_config_the_pushed_commit_lacks(self):
+        r = self.tracked_config()
+        head = self.orphan(r, "bare")
+
+        res = r.turnstile("__pre-push", "origin",
+                          stdin=f"refs/heads/bare {head} refs/heads/bare {'0' * 40}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(f"origin/main {self.WARNING}", res.stderr)
+
+    def test_stays_quiet_when_no_default_branch_tracks_a_config(self):
+        r = Repo(self)
+        head = self.orphan(r, "bare")
+
+        res = r.turnstile("__pre-push", "origin",
+                          stdin=f"refs/heads/bare {head} refs/heads/bare {'0' * 40}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn(self.WARNING, res.stderr)
+
+    def test_consults_the_remote_being_pushed_to(self):
+        r = self.tracked_config()
+        other = os.path.join(r.tmp, "other.git")
+        subprocess.run(["git", "init", "-q", "--bare", other], env=r.env, check=True)
+        r.git("remote", "add", "mirror", other)
+        r.git("push", "-q", "mirror", "main", "--no-verify")
+        r.git("update-ref", "-d", "refs/remotes/origin/main")
+        head = self.orphan(r, "bare")
+
+        to_origin = r.turnstile("__pre-push", "origin",
+                                stdin=f"refs/heads/bare {head} refs/heads/bare {'0' * 40}\n")
+        to_mirror = r.turnstile("__pre-push", "mirror",
+                                stdin=f"refs/heads/bare {head} refs/heads/bare {'0' * 40}\n")
+
+        self.assertNotIn(self.WARNING, to_origin.stderr)
+        self.assertIn(f"mirror/main {self.WARNING}", to_mirror.stderr)
+
+    def test_warns_once_for_a_push_of_several_refs(self):
+        r = self.tracked_config()
+        first = self.orphan(r, "bare-one")
+        second = self.orphan(r, "bare-two")
+        zero = "0" * 40
+
+        res = r.turnstile("__pre-push", "origin",
+                          stdin=f"refs/heads/bare-one {first} refs/heads/bare-one {zero}\n"
+                                f"refs/heads/bare-two {second} refs/heads/bare-two {zero}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stderr.count(self.WARNING), 1, res.stderr)
+
+
 class FailureSummary(unittest.TestCase):
     CONFIG = """
         lint: echo 'src/a.go:3: undefined: x'; echo 'make: *** [lint] Error 1'; exit 2
@@ -1578,6 +1816,16 @@ class FailureSummary(unittest.TestCase):
         res = r.turnstile("run", "--no-ai")
 
         self.assertIn("tree: modified while fmt ran", res.stderr.split("$ ")[0])
+
+    def test_the_summary_names_rewritten_non_ascii_files_as_they_are_on_disk(self):
+        r = Repo(self)
+        r.write("lib/Kundenliste_M\u00fcller.csv", "x\n")
+        r.commit_all("umlaut")
+        r.config("fmt: echo formatted > lib/Kundenliste_M\u00fcller.csv\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertIn("lib/Kundenliste_M\u00fcller.csv", res.stderr.split("$ ")[0])
 
     def test_the_stop_hook_reason_starts_with_the_summary_even_when_the_report_is_cut(self):
         r = Repo(self)
