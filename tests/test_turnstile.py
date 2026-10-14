@@ -605,6 +605,482 @@ class CannotRunHere(unittest.TestCase):
         self.assertIn("e2e (could not run: no docker)", out["systemMessage"])
 
 
+SLEEPY_CLAUDE = "#!/usr/bin/env python3\nimport time\ntime.sleep(5)\n"
+
+
+def ai_repo(test: unittest.TestCase, config: str = "ai m: block=high\n",
+            frontmatter: str = "") -> Repo:
+    """A repo whose gate (config and module) is already on the remote, so a range
+    review sees only what the test commits afterwards."""
+    r = Repo(test)
+    r.write(".turnstile.d/modules/m.md", f"---\nname: m\n{frontmatter}---\nReview it.\n")
+    r.config(config)
+    r.commit_all("gate")
+    r.git("push", "-q", "origin", "main", "--no-verify")
+    return r
+
+
+class AiTimeout(unittest.TestCase):
+    def test_a_timed_out_module_is_a_question_mark_not_a_failure(self):
+        r = ai_repo(self)
+        r.fake("claude", SLEEPY_CLAUDE)
+        r.env["TURNSTILE_AI_TIMEOUT"] = "1"
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.pre_push()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertRegex(res.stderr, r"\? ai m .*timed out after 1s")
+        self.assertIn("ai module(s) could not run - this push was NOT reviewed by them", res.stderr)
+
+    def test_config_timeout_overrides_the_environment(self):
+        r = ai_repo(self, "ai m: timeout=1\n")
+        r.fake("claude", SLEEPY_CLAUDE)
+        r.env["TURNSTILE_AI_TIMEOUT"] = "600"
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.turnstile("ai", "--range", "origin/main..HEAD")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("timed out after 1s", res.stderr)
+
+    def test_config_timeout_wins_over_frontmatter(self):
+        r = ai_repo(self, "ai m: timeout=1\n", "timeout: 600\n")
+        r.fake("claude", SLEEPY_CLAUDE)
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.turnstile("ai", "--range", "origin/main..HEAD")
+
+        self.assertIn("timed out after 1s", res.stderr)
+
+    def test_frontmatter_timeout_wins_over_the_environment(self):
+        r = ai_repo(self, "ai m: block=high\n", "timeout: 1\n")
+        r.fake("claude", SLEEPY_CLAUDE)
+        r.env["TURNSTILE_AI_TIMEOUT"] = "600"
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.turnstile("ai", "--range", "origin/main..HEAD")
+
+        self.assertIn("timed out after 1s", res.stderr)
+
+    def test_an_explicit_timeout_flag_wins_over_the_frontmatter(self):
+        r = ai_repo(self, "ai m: block=high\n", "timeout: 600\n")
+        r.fake("claude", SLEEPY_CLAUDE)
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.turnstile("ai", "--range", "origin/main..HEAD", "--timeout", "1")
+
+        self.assertIn("timed out after 1s", res.stderr)
+
+    def test_config_timeout_wins_over_an_explicit_timeout_flag(self):
+        r = ai_repo(self, "ai m: timeout=1\n")
+        r.fake("claude", SLEEPY_CLAUDE)
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.turnstile("ai", "--range", "origin/main..HEAD", "--timeout", "600")
+
+        self.assertIn("timed out after 1s", res.stderr)
+
+    def test_an_unparseable_timeout_in_the_environment_does_not_stop_the_review(self):
+        r = ai_repo(self)
+        r.env["TURNSTILE_AI_TIMEOUT"] = "soon"
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.turnstile("ai", "--range", "origin/main..HEAD")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("TURNSTILE_AI_TIMEOUT='soon' is not a positive integer, using 600", res.stderr)
+        self.assertEqual(len(r.prompts()), 1)
+
+    def test_bad_timeout_value_is_a_config_error(self):
+        r = ai_repo(self, "ai m: timeout=abc\n")
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.turnstile("ai", "--range", "origin/main..HEAD")
+        strict = r.turnstile("ai", "--range", "origin/main..HEAD", "--strict")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(".turnstile:1: timeout='abc' is not a positive integer", res.stderr)
+        self.assertEqual(r.prompts(), [])
+        self.assertEqual(strict.returncode, 2, strict.stderr)
+
+    def test_a_zero_timeout_is_a_config_error(self):
+        r = ai_repo(self, "ai m: timeout=0\n")
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.turnstile("ai", "--range", "origin/main..HEAD")
+
+        self.assertIn("timeout='0' is not a positive integer", res.stderr)
+        self.assertEqual(r.prompts(), [])
+
+    def test_bad_frontmatter_timeout_is_a_config_error(self):
+        r = ai_repo(self, "ai m: block=high\n", "timeout: soon\n")
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.turnstile("ai", "--range", "origin/main..HEAD")
+        strict = r.turnstile("ai", "--range", "origin/main..HEAD", "--strict")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("timeout: 'soon' is not a positive integer", res.stderr)
+        self.assertEqual(r.prompts(), [])
+        self.assertEqual(strict.returncode, 2, strict.stderr)
+
+
+class AiFailClosed(unittest.TestCase):
+    def cannot_run(self, config: str = "ai m: fail=closed\n") -> Repo:
+        r = ai_repo(self, config)
+        r.fake("claude", SLEEPY_CLAUDE)
+        r.env["TURNSTILE_AI_TIMEOUT"] = "1"
+        r.write("a.txt", "changed\n")
+        return r
+
+    def test_fail_closed_module_that_cannot_run_refuses_the_push(self):
+        r = self.cannot_run()
+        r.commit_all()
+
+        res = r.pre_push()
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("ai m (could not run: timed out after 1s) [fail=closed]", res.stderr)
+        self.assertIn("push refused", res.stderr)
+        self.assertNotIn("? ai m", res.stderr)
+
+    def test_fail_closed_applies_to_a_staged_review_too(self):
+        r = self.cannot_run()
+        r.git("add", "-A")
+
+        res = r.turnstile("ai", "--staged")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("[fail=closed]", res.stderr)
+
+    def test_fail_open_module_that_cannot_run_keeps_the_question_mark(self):
+        r = self.cannot_run("ai m: fail=open\n")
+        r.commit_all()
+
+        res = r.pre_push()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("? ai m (timed out after 1s)", res.stderr)
+        self.assertNotIn("fail=closed", res.stderr)
+
+    def test_fail_closed_module_that_runs_green_passes(self):
+        r = ai_repo(self, "ai m: fail=closed\n")
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.pre_push()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("fail=closed", res.stderr)
+
+    def test_fail_closed_module_that_cannot_be_loaded_refuses_the_push(self):
+        r = ai_repo(self, "ai ghost: fail=closed\n")
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.pre_push()
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("ai ghost (could not run: no module 'ghost') [fail=closed]", res.stderr)
+
+    def test_fail_open_module_that_cannot_be_loaded_does_not_refuse(self):
+        r = ai_repo(self, "ai ghost: block=high\n")
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.pre_push()
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_fail_closed_line_with_a_bad_timeout_refuses_the_push(self):
+        r = ai_repo(self, "ai m: timeout=abc fail=closed\n")
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.pre_push()
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("ai m (could not run: timeout='abc' is not a positive integer) [fail=closed]",
+                      res.stderr)
+        self.assertEqual(r.prompts(), [])
+
+    def test_fail_closed_refuses_when_the_diff_cannot_be_read(self):
+        r = ai_repo(self, "ai m: fail=closed\n")
+
+        res = r.turnstile("ai", "--range", "nosuchref..HEAD")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("fail=closed", res.stderr)
+
+    def test_fail_open_module_lets_an_unreadable_diff_through(self):
+        r = ai_repo(self, "ai m: block=high\n")
+
+        res = r.turnstile("ai", "--range", "nosuchref..HEAD")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_bad_fail_value_is_a_config_error(self):
+        r = ai_repo(self, "ai m: fail=sideways\n")
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.turnstile("ai", "--range", "origin/main..HEAD")
+        strict = r.turnstile("ai", "--range", "origin/main..HEAD", "--strict")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(".turnstile:1: fail='sideways' is not one of open, closed", res.stderr)
+        self.assertEqual(r.prompts(), [])
+        self.assertEqual(strict.returncode, 2, strict.stderr)
+
+    def test_frontmatter_cannot_opt_a_module_into_failing_closed(self):
+        r = ai_repo(self, "ai m: block=high\n", "fail: closed\n")
+        r.fake("claude", SLEEPY_CLAUDE)
+        r.env["TURNSTILE_AI_TIMEOUT"] = "1"
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = r.turnstile("ai", "--range", "origin/main..HEAD")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("? ai m", res.stderr)
+
+
+class AiDiffSelection(unittest.TestCase):
+    def repo(self, max_lines: int = 40) -> Repo:
+        r = ai_repo(self)
+        r.env["TURNSTILE_AI_MAX_DIFF_LINES"] = str(max_lines)
+        return r
+
+    def big_and_tail(self, r: Repo) -> None:
+        r.write("aa_big.txt", "".join(f"filler {i}\n" for i in range(300)))
+        r.write("zz_tail.txt", "TAIL-MARKER\n")
+        r.commit_all()
+
+    def review(self, r: Repo, *args: str) -> subprocess.CompletedProcess:
+        return r.turnstile("ai", "--range", "origin/main..HEAD", *args)
+
+    def test_every_changed_file_contributes_when_the_diff_is_truncated(self):
+        r = self.repo()
+        self.big_and_tail(r)
+
+        res = self.review(r)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("TAIL-MARKER", r.prompts()[0]["prompt"])
+
+    def test_a_file_too_big_to_fit_whole_is_cut_with_a_marker(self):
+        r = self.repo(100)
+        self.big_and_tail(r)
+
+        self.review(r)
+
+        prompt = r.prompts()[0]["prompt"]
+        self.assertIn("TAIL-MARKER", prompt)
+        self.assertIn("filler 0", prompt)
+        self.assertNotIn("filler 299", prompt)
+        self.assertRegex(prompt, r"\.\.\. \[aa_big\.txt: showing \d+ of 306 diff lines\]")
+        self.assertNotIn("omitted:", prompt)
+
+    def test_truncation_names_the_omitted_files(self):
+        r = self.repo()
+        self.big_and_tail(r)
+
+        res = self.review(r)
+
+        prompt = r.prompts()[0]["prompt"]
+        self.assertRegex(prompt, r"NOTE: diff truncated: showing 1 of 2 changed files "
+                                 r"\(\d+ of 3\d\d lines\); omitted: aa_big\.txt\. "
+                                 r"Do not report on what you cannot see\.")
+        self.assertRegex(res.stderr, r"! turnstile-ai: diff truncated:.*omitted: aa_big\.txt")
+
+    def test_the_stderr_warning_lists_at_most_ten_omitted_paths(self):
+        r = self.repo(10)
+        for i in range(15):
+            r.write(f"f{i:02}.txt", "".join(f"row {j}\n" for j in range(20)))
+        r.commit_all()
+
+        res = self.review(r)
+
+        warning = next(l for l in res.stderr.splitlines() if "diff truncated:" in l)
+        self.assertIn("(+5 more)", warning)
+        self.assertEqual(warning.count(".txt"), 10)
+        self.assertIn("f14.txt", r.prompts()[0]["prompt"])
+
+    def test_generated_files_are_dropped_before_source(self):
+        r = self.repo(100)
+        r.write("package-lock.json", "".join(f"LOCK-CONTENT-{i}\n" for i in range(30)))
+        r.write("src.py", "".join(f"SRC-LINE-{i}\n" for i in range(70)))
+        r.commit_all()
+
+        self.review(r)
+
+        prompt = r.prompts()[0]["prompt"]
+        self.assertIn("SRC-LINE-69", prompt)
+        self.assertNotIn("LOCK-CONTENT", prompt)
+        self.assertIn("omitted: package-lock.json", prompt)
+
+    def test_a_partial_review_writes_no_pass_record(self):
+        r = self.repo()
+        r.write("a.txt", "FIRST-CHANGE\n")
+        self.big_and_tail(r)
+        self.assertEqual(self.review(r).returncode, 0)
+
+        r.write("lib/b.txt", "SECOND-CHANGE\n")
+        r.commit_all("second")
+        res = self.review(r)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("follow-up since", res.stderr)
+        prompt = r.prompts()[-1]["prompt"]
+        self.assertIn("FIRST-CHANGE", prompt)
+        self.assertIn("SECOND-CHANGE", prompt)
+
+    def test_a_partial_review_says_so_in_the_report(self):
+        r = self.repo()
+        self.big_and_tail(r)
+
+        res = self.review(r)
+
+        self.assertRegex(res.stderr, r"✓ ai m \(no findings, partial review, ")
+
+    def test_json_reports_truncation(self):
+        r = self.repo()
+        self.big_and_tail(r)
+
+        res = self.review(r, "--json")
+
+        out = json.loads(res.stdout)
+        self.assertEqual(out["truncation"]["omitted_files"], ["aa_big.txt"])
+        self.assertEqual(out["truncation"]["shown_files"], 1)
+        self.assertEqual(out["truncation"]["total_files"], 2)
+        self.assertIn("diff truncated", out["truncation"]["note"])
+        self.assertTrue(all(res["partial"] for res in out["results"]))
+
+    def test_json_truncation_is_null_when_nothing_was_cut(self):
+        r = self.repo(4000)
+        r.write("a.txt", "small\n")
+        r.commit_all()
+
+        out = json.loads(self.review(r, "--json").stdout)
+
+        self.assertIsNone(out["truncation"])
+        self.assertFalse(any(res["partial"] for res in out["results"]))
+
+    def test_small_diff_is_not_truncated(self):
+        r = self.repo(4000)
+        r.write("a.txt", "FIRST-CHANGE\n")
+        r.commit_all("first")
+        first = self.review(r)
+
+        r.write("lib/b.txt", "SECOND-CHANGE\n")
+        r.commit_all("second")
+        second = self.review(r)
+
+        for res in (first, second):
+            self.assertNotIn("truncated", res.stderr)
+            self.assertNotIn("partial", res.stderr)
+        self.assertNotIn("truncated", r.prompts()[0]["prompt"])
+        self.assertIn("follow-up since", second.stderr)
+
+    def test_a_byte_heavy_file_does_not_crowd_out_the_small_ones_after_it(self):
+        r = self.repo(4000)
+        r.env["TURNSTILE_AI_MAX_DIFF_BYTES"] = "2000"
+        r.write("a_wide.txt", "w" * 5000 + "\n")
+        for name in ("b", "c", "d"):
+            r.write(f"{name}.txt", f"SMALL-{name}\nrow\nrow\n")
+        r.commit_all()
+
+        self.review(r)
+
+        prompt = r.prompts()[0]["prompt"]
+        for name in ("b", "c", "d"):
+            self.assertIn(f"SMALL-{name}", prompt)
+
+    def test_a_form_feed_in_a_line_does_not_count_as_a_line_break(self):
+        r = self.repo(40)
+        r.write("ff.txt", "".join("x\x0cy\n" for _ in range(30)))
+        r.commit_all()
+
+        res = self.review(r)
+
+        self.assertNotIn("truncated", res.stderr)
+
+    def test_lockfiles_and_generated_code_of_other_ecosystems_go_last(self):
+        r = self.repo(100)
+        for name in ("go.sum", "pnpm-lock.yaml", "x_pb2.py", "x_pb2_grpc.py"):
+            r.write(name, "".join(f"GEN-{i}\n" for i in range(30)))
+        r.write("src.py", "".join(f"SRC-LINE-{i}\n" for i in range(70)))
+        r.commit_all()
+
+        self.review(r)
+
+        prompt = r.prompts()[0]["prompt"]
+        self.assertIn("SRC-LINE-69", prompt)
+        self.assertNotIn("GEN-", prompt)
+
+    def test_an_unparseable_budget_in_the_environment_does_not_stop_the_review(self):
+        r = ai_repo(self)
+        r.env["TURNSTILE_AI_MAX_DIFF_LINES"] = "lots"
+        r.env["TURNSTILE_AI_MAX_DIFF_BYTES"] = "0"
+        r.write("a.txt", "changed\n")
+        r.commit_all()
+
+        res = self.review(r)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("TURNSTILE_AI_MAX_DIFF_LINES='lots' is not a positive integer, using 4000",
+                      res.stderr)
+        self.assertIn("TURNSTILE_AI_MAX_DIFF_BYTES='0' is not a positive integer, using 400000",
+                      res.stderr)
+        self.assertEqual(len(r.prompts()), 1)
+
+    def test_a_follow_up_diff_over_budget_is_partial_too(self):
+        r = self.repo(40)
+        r.write("a.txt", "FIRST-CHANGE\n")
+        r.commit_all("first")
+        self.assertEqual(self.review(r).returncode, 0)
+
+        self.big_and_tail(r)
+        res = self.review(r)
+
+        self.assertIn("follow-up since", res.stderr)
+        self.assertIn("partial review", res.stderr)
+        self.assertIn("omitted: aa_big.txt", r.prompts()[-1]["prompt"])
+
+    def test_a_hand_made_diff_is_cut_by_position(self):
+        r = self.repo(5)
+        patch = os.path.join(r.tmp, "x.patch")
+        with open(patch, "w") as fh:
+            fh.write("--- a/x\n+++ b/x\n@@ -0,0 +1,9 @@\n" + "".join(f"+row {i}\n" for i in range(9)))
+
+        res = r.turnstile("ai", "--diff-file", patch, "--module", "m")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("diff truncated to 5 of 12 lines", r.prompts()[0]["prompt"])
+
+    def test_non_ascii_paths_are_named_as_they_are(self):
+        r = self.repo(10)
+        r.write("zzz.txt", "".join(f"row {j}\n" for j in range(20)))
+        r.write("über.txt", "tiny\n")
+        r.commit_all()
+
+        res = self.review(r)
+
+        self.assertIn("omitted: zzz.txt", res.stderr)
+        self.assertIn("diff --git a/über.txt b/über.txt", r.prompts()[0]["prompt"])
+
+
 class Ci(unittest.TestCase):
     def pull_request(self, base_config: str, pr_config: str | None = None) -> Repo:
         r = Repo(self)
@@ -1026,6 +1502,11 @@ class RepoHook(unittest.TestCase):
         bare = os.path.join(r.tmp, "bare-bin")
         os.makedirs(bare)
         os.symlink(shutil.which("git"), os.path.join(bare, "git"))
+        # Some git builds resolve receive-pack via PATH rather than their
+        # exec path; the bare PATH must only be missing turnstile, not git.
+        receive = shutil.which("git-receive-pack")
+        if receive:
+            os.symlink(receive, os.path.join(bare, "git-receive-pack"))
 
         res = subprocess.run(["git", "push", "origin", "HEAD:refs/heads/topic"], cwd=r.root,
                              env={**r.env, "PATH": bare}, capture_output=True, text=True)
@@ -1114,9 +1595,11 @@ class StopHook(unittest.TestCase):
     def stop(self, r: Repo, active: bool = False, env: dict | None = None) -> subprocess.CompletedProcess:
         payload = {"session_id": "s1", "cwd": r.root, "hook_event_name": "Stop",
                    "stop_hook_active": active}
+        # A loaded machine pushes real check time past the 10s default notice;
+        # only tests that opt in via env should see the slow-run message.
         return subprocess.run([TURNSTILE, "hook", "claude-stop"], input=json.dumps(payload),
-                              env={**r.env, **(env or {})}, capture_output=True, text=True,
-                              cwd=r.root)
+                              env={**r.env, "TURNSTILE_SLOW_NOTICE": "600", **(env or {})},
+                              capture_output=True, text=True, cwd=r.root)
 
     def test_repo_without_turnstile_config_is_left_alone(self):
         r = Repo(self)
@@ -1245,8 +1728,8 @@ class StopInDevEnvironment(unittest.TestCase):
             command = json.load(fh)["hooks"]["Stop"][0]["hooks"][0]["command"]
         payload = {"session_id": "s1", "cwd": self.r.root, "hook_event_name": "Stop"}
         return subprocess.run(["/bin/sh", "-c", command], input=json.dumps(payload),
-                              env={**self.env, **extra}, capture_output=True, text=True,
-                              cwd=self.r.tmp)
+                              env={**self.env, "TURNSTILE_SLOW_NOTICE": "600", **extra},
+                              capture_output=True, text=True, cwd=self.r.tmp)
 
     def nix_calls(self) -> list[str]:
         try:
