@@ -71,7 +71,7 @@ turnstile install
 turnstile doctor
 ```
 
-`turnstile files` needs `perl` on PATH, which `doctor` checks. The AI modules
+`turnstile files` and `turnstile scan` need `perl` on PATH, which `doctor` checks. The AI modules
 additionally need `python3` and the `claude` CLI on PATH; `doctor` checks for
 both, but only in a repo that actually configures a module.
 Symlink `bin/turnstile-ai` too if you want to call the runner directly (for a
@@ -239,6 +239,8 @@ turnstile run          run this repo's checks on the working tree, without pushi
   --stop               what an agent's turn end runs: no ai, no push-only checks
 turnstile ci --base <ref>   CI: deterministic checks only, no cache, config read from <ref>
 turnstile files [--glob G] [-0]   changed files of the push that still exist
+turnstile scan added --forbid REGEX [--since-base]   refuse added lines matching REGEX (PCRE)
+turnstile scan added --forbid-secrets                builtin secret patterns, per pushed commit
 turnstile ai [args]    run only the ai modules
 turnstile hook claude-stop        Claude Code Stop hook, payload on stdin
 turnstile print-claude-settings   the Stop hook block for .claude/settings.json
@@ -325,6 +327,40 @@ turnstile files --glob '**/*.kt'
 
 Without `TURNSTILE_MODE`, a set `TURNSTILE_RANGE` means push mode, so a script
 can run `TURNSTILE_RANGE=origin/main..HEAD turnstile files` by hand.
+
+### Refusing added lines
+
+`turnstile scan added` fails when the push adds a line that matches a pattern.
+It scans the same scope as `files`, so a merged-in `main` never charges the
+pusher, and a worktree run also scans uncommitted edits and untracked files.
+
+By default each pushed commit is scanned on its own. A secret that one commit
+adds and the next removes is still in the history you push, so it is caught.
+With `--since-base` the scan reads one net diff against the merge-base with the
+default branch. A line added and later reverted passes, which suits stylistic
+rules that only care about the final text.
+
+- `--forbid REGEX` adds a PCRE pattern and can repeat. `--id NAME` after it
+  names that pattern in the report. Unnamed patterns are `forbid`, `forbid2`
+  and so on.
+- `--forbid-secrets` adds the builtin patterns: private keys, AWS access keys,
+  GitHub, GitLab, Atlassian and Slack tokens, and `sk-` style API keys.
+
+A finding reads `  x id: path:line (context)`, where the context is the
+commit, `since-base`, `uncommitted` or `untracked`. The matched line is never
+printed, so a secret that trips the scan does not land in a CI log. The exit
+status is 0 when clean, 1 for findings and 2 when the scan could not run, for
+instance on a bad option, a bad pattern or an unknown range. It never reports a
+skip. Untracked files that look binary or exceed 10 MB are not scanned, and a
+trailing carriage return is ignored when matching.
+
+```
+turnstile scan added --forbid-secrets
+turnstile scan added --forbid '\x{2014}' --since-base
+```
+
+The first line is a secrets check. The second keeps an em dash out of new
+prose. Put either command after a check name in `.turnstile`.
 
 ## The agent's loop
 
