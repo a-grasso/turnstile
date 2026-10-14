@@ -71,9 +71,9 @@ turnstile install
 turnstile doctor
 ```
 
-`turnstile files` and `turnstile scan` need `perl` on PATH, which `doctor` checks. The AI modules
-additionally need `python3` and the `claude` CLI on PATH; `doctor` checks for
-both, but only in a repo that actually configures a module.
+`turnstile files` and `turnstile scan` need `perl` on PATH, and `scan added --kaibo-checks` and the AI
+modules need `python3`; `doctor` checks both. The AI modules additionally need the `claude` CLI on
+PATH, which `doctor` checks only in a repo that actually configures a module.
 Symlink `bin/turnstile-ai` too if you want to call the runner directly (for a
 pre-commit hook, say) rather than through `turnstile ai`.
 
@@ -241,6 +241,7 @@ turnstile ci --base <ref>   CI: deterministic checks only, no cache, config read
 turnstile files [--glob G] [-0]   changed files of the push that still exist
 turnstile scan added --forbid REGEX [--since-base]   refuse added lines matching REGEX (PCRE)
 turnstile scan added --forbid-secrets                builtin secret patterns, per pushed commit
+turnstile scan added --kaibo-checks                  kaibo binding forbid_regex checks over added lines
 turnstile scan paths --forbid-gitignored             refuse pushed paths the tracked .gitignore ignores
 turnstile ai [args]    run only the ai modules
 turnstile hook claude-stop        Claude Code Stop hook, payload on stdin
@@ -346,6 +347,13 @@ rules that only care about the final text.
   and so on.
 - `--forbid-secrets` adds the builtin patterns: private keys, AWS access keys,
   GitHub, GitLab, Atlassian and Slack tokens, and `sk-` style API keys.
+- `--kaibo-checks` adds the `forbid_regex` checks of the binding standards in
+  the kaibo knowledge corpus (`TURNSTILE_KAIBO_KNOWLEDGE`, default
+  `~/.kaibo/knowledge`). Other check kinds are skipped. In this version every
+  binding check applies to all added lines, because `applies_to` tags are not
+  read yet. A missing corpus, a corpus with no binding checks, or a binding
+  page with unreadable checks exits 2. Patterns compile as Perl PCRE, so
+  `\x{2014}` style escapes work. A pattern that fails to compile exits 2 naming its id.
 
 A finding reads `  x id: path:line (context)`, where the context is the
 commit, `since-base`, `uncommitted` or `untracked`. The matched line is never
