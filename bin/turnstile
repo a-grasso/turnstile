@@ -1121,18 +1121,24 @@ scan_worktree_extras() {
   return $rc
 }
 
+# A merge counts only for what it changed against a re-merge of its parents.
+commit_paths() {
+  local filter="$1" sha="$2" parents="$3"
+  shift 3
+  local -a merge=()
+  if [ "$parents" -gt 1 ]; then
+    if [ "$REMERGE_OK" = 1 ]; then merge=(--remerge-diff); else merge=(-c); fi
+  fi
+  git -c core.quotePath=false diff-tree -r -M -z --root --name-only --diff-filter="$filter" --format= \
+    ${merge[@]+"${merge[@]}"} "$sha" -- "$@"
+}
+
 files_collect() {
   local sha parents commits
-  local -a merge
   commits="$(pushed_commits)" || return 2
   while read -r sha parents; do
     [ -n "$sha" ] || continue
-    merge=()
-    if [ "$parents" -gt 1 ]; then
-      if [ "$REMERGE_OK" = 1 ]; then merge=(--remerge-diff); else merge=(-c); fi
-    fi
-    git -c core.quotePath=false diff-tree -r -z --root --name-only --diff-filter=d --format= \
-      ${merge[@]+"${merge[@]}"} "$sha" -- "$@" || return 2
+    commit_paths d "$sha" "$parents" "$@" || return 2
   done <<<"$commits"
 
   [ "$SCOPE_MODE" = worktree ] || return 0
@@ -1277,11 +1283,146 @@ cmd_scan_added() {
   esac
 }
 
+# One context per commit, announced by an empty record since no path is empty, then that commit's paths.
+paths_added_collect() {
+  local sha parents commits
+  commits="$(pushed_commits)" || return 2
+  while read -r sha parents; do
+    [ -n "$sha" ] || continue
+    printf '\0%s\0' "${sha:0:7}"
+    commit_paths AR "$sha" "$parents" || return 2
+  done <<<"$commits"
+
+  [ "$SCOPE_MODE" = worktree ] || return 0
+  printf '\0uncommitted\0'
+  git -c core.quotePath=false diff -M --name-only -z --diff-filter=AR HEAD || return 2
+}
+
+# "paths" lists each added path once for check-ignore. "report" names the ones its verdict says a tracked .gitignore
+# ignores and ends with the count, which only perl can take since a path may hold a newline. --no-index judges
+# paths the push may have untracked since. A source counts only when it is a .gitignore the tip tracks (the index
+# too in a worktree run), so .git/info/exclude, global excludes and a personal relative excludesFile stay personal.
+IFS= read -r -d '' PATHS_PERL <<'PERL' || true
+use strict;
+use warnings;
+local $/;
+my ($mode, $added, $verdict) = @ARGV;
+open(my $in, '<:raw', $added) or exit 2;
+my @added = split /\0/, <$in>, -1;
+pop @added;
+
+my $expect_marker = 1;
+for (my $i = 0; $i < @added; $i++) {
+    if ($added[$i] eq '') {
+        $i++;
+        exit 2 unless defined $added[$i] && $added[$i] =~ /\A(?:[0-9a-f]{7,40}|uncommitted)\z/;
+        $expect_marker = 0;
+    } else {
+        exit 2 if $expect_marker;
+    }
+}
+
+my (%ignored, %tracked);
+sub tracked_source {
+    my ($source) = @_;
+    return $tracked{$source} //= do {
+        open(local *STDERR, '>', '/dev/null') or exit 2;
+        open(local *STDOUT, '>', '/dev/null') or exit 2;
+        my $found = system('git', 'cat-file', '-e', "$ENV{TS_TIP}:$source") == 0;
+        $found ||= system('git', 'ls-files', '--error-unmatch', '--', $source) == 0 if $ENV{TS_WORKTREE};
+        $found ? 1 : 0;
+    };
+}
+
+if ($mode eq 'report') {
+    open(my $v, '<:raw', $verdict) or exit 2;
+    my @fields = split /\0/, <$v>;
+    while (my ($source, undef, $pattern, $path) = splice @fields, 0, 4) {
+        next unless defined $path && $source =~ m{\A(?:.*/)?\.gitignore\z} && $pattern !~ /\A!/;
+        $ignored{$path} = 1 if $source !~ m{\A/} && tracked_source($source);
+    }
+}
+
+my ($context, $count, %seen) = ('', 0);
+while (@added) {
+    my $path = shift @added;
+    if ($path eq '') { $context = shift @added; next; }
+    if ($mode eq 'paths') { print "$path\0" unless $seen{$path}++; next; }
+    next unless $ignored{$path} && !$seen{"$context\0$path"}++;
+    print "  x gitignored: $path ($context)\n";
+    $count++;
+}
+print "scan: $count gitignored path(s) added\n" if $mode eq 'report' && $count;
+exit($mode eq 'report' && $count ? 1 : 0);
+PERL
+readonly PATHS_PERL
+
+# One unjudgeable path, such as one beyond a symlink in the checkout, must not hide the rest.
+paths_judge() {
+  local dir="$1" path judged=0 failed=0
+  git -c core.quotePath=false check-ignore --no-index -v -z --stdin <"$dir/paths" >"$dir/verdict" 2>/dev/null
+  [ $? -le 1 ] && return 0
+
+  : >"$dir/verdict"
+  while IFS= read -r -d '' path; do
+    printf '%s\0' "$path" | git -c core.quotePath=false check-ignore --no-index -v -z --stdin >"$dir/one" 2>/dev/null
+    if [ "${PIPESTATUS[1]}" -le 1 ]; then
+      cat "$dir/one" >>"$dir/verdict"
+      judged=$((judged + 1))
+    else
+      warn "turnstile: could not judge $path"
+      failed=$((failed + 1))
+    fi
+  done <"$dir/paths"
+  [ "$failed" -eq 0 ] || [ "$judged" -gt 0 ]
+}
+
+scan_paths_run() {
+  local dir rc
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/turnstile-paths.XXXXXX")" || return 2
+  paths_added_collect >"$dir/added" || { rm -rf "$dir"; return 2; }
+  perl -e "$PATHS_PERL" paths "$dir/added" >"$dir/paths" || { rm -rf "$dir"; return 2; }
+  if paths_judge "$dir"; then
+    TS_TIP="$SCOPE_TIP" TS_WORKTREE="$([ "$SCOPE_MODE" = worktree ] && echo 1)" \
+      perl -e "$PATHS_PERL" report "$dir/added" "$dir/verdict"
+    rc=$?
+  else
+    rc=2
+  fi
+  rm -rf "$dir"
+  return $rc
+}
+
+cmd_scan_paths() {
+  require_perl
+  local forbid_gitignored=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --forbid-gitignored) forbid_gitignored=1 ;;
+      -h|--help)           usage; return 0 ;;
+      *)                   scope_fail "unknown option for scan paths: $1" ;;
+    esac
+    shift
+  done
+  [ -n "$forbid_gitignored" ] || scope_fail "scan paths needs a mode: --forbid-gitignored"
+
+  local root; root="$(repo_root)" || scope_fail "not inside a git repository"
+  cd "$root" || exit 2
+  scope_resolve
+
+  local rc
+  scan_paths_run
+  rc=$?
+  [ "$rc" -lt 2 ] || exit 2
+  return $rc
+}
+
 cmd_scan() {
   case "${1:-}" in
     added)     shift; cmd_scan_added "$@" ;;
+    paths)     shift; cmd_scan_paths "$@" ;;
     -h|--help) usage; return 0 ;;
-    "")        scope_fail "scan needs a subcommand: added" ;;
+    "")        scope_fail "scan needs a subcommand: added or paths" ;;
     *)         scope_fail "unknown scan subcommand: $1" ;;
   esac
 }
@@ -1588,6 +1729,7 @@ usage() {
     turnstile files [--glob G] [-0]   changed files of the push that still exist
     turnstile scan added --forbid REGEX [--since-base]   refuse added lines matching REGEX (PCRE)
     turnstile scan added --forbid-secrets                builtin secret patterns, per pushed commit
+    turnstile scan paths --forbid-gitignored        refuse pushed paths the tracked .gitignore ignores
     turnstile ai [args]    run just the ai modules (see: turnstile ai --help)
     turnstile hook claude-stop
                            Claude Code Stop hook: reads the payload on stdin

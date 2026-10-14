@@ -2711,6 +2711,320 @@ class ScanAdded(unittest.TestCase):
         self.assertIn("--id", res.stderr)
 
 
+class ScanPaths(unittest.TestCase):
+    RANGE = {"TURNSTILE_RANGE": "origin/main..HEAD"}
+
+    def scan(self, r: Repo, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run([TURNSTILE, "scan", "paths", *args], cwd=r.root,
+                              env={**r.env, **(self.RANGE if env is None else env)},
+                              capture_output=True, text=True)
+
+    def forbid(self, r: Repo, env: dict | None = None) -> subprocess.CompletedProcess:
+        return self.scan(r, "--forbid-gitignored", env=env)
+
+    def feature(self, r: Repo) -> None:
+        r.git("switch", "-q", "-c", "feature")
+
+    def ignore_data(self, r: Repo) -> None:
+        r.write(".gitignore", "data/\n")
+        r.git("add", ".gitignore")
+        r.git("commit", "-qm", "ignore data")
+
+    def force_add(self, r: Repo, rel: str, msg: str = "force add") -> str:
+        r.write(rel, "name\n")
+        r.git("add", "-f", rel)
+        r.git("commit", "-qm", msg)
+        return r.git("rev-parse", "--short=7", "HEAD").strip()
+
+    def test_a_force_added_ignored_file_is_refused_with_its_commit(self):
+        r = Repo(self)
+        self.feature(r)
+        self.ignore_data(r)
+        sha = self.force_add(r, "data/rows.csv")
+
+        res = self.forbid(r)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn(f"  x gitignored: data/rows.csv ({sha})", res.stdout)
+        self.assertIn("scan: 1 gitignored path(s) added", res.stdout)
+
+    def test_a_path_the_push_untracks_again_is_still_refused(self):
+        r = Repo(self)
+        self.feature(r)
+        self.ignore_data(r)
+        sha = self.force_add(r, "data/rows.csv")
+        r.git("rm", "-q", "--cached", "data/rows.csv")
+        r.git("commit", "-qm", "untrack")
+
+        res = self.forbid(r)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn(f"  x gitignored: data/rows.csv ({sha})", res.stdout)
+
+    def test_a_path_only_info_exclude_lists_is_not_refused(self):
+        r = Repo(self)
+        self.feature(r)
+        with open(os.path.join(r.root, ".git", "info", "exclude"), "a") as fh:
+            fh.write("data/\n")
+        self.force_add(r, "data/rows.csv")
+
+        res = self.forbid(r)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_a_path_only_a_global_excludes_file_lists_is_not_refused(self):
+        r = Repo(self)
+        self.feature(r)
+        excludes = os.path.join(r.tmp, "global-ignore")
+        with open(excludes, "w") as fh:
+            fh.write("data/\n")
+        r.git("config", "--global", "core.excludesFile", excludes)
+        self.force_add(r, "data/rows.csv")
+
+        res = self.forbid(r)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_a_global_excludes_file_named_gitignore_is_not_refused(self):
+        r = Repo(self)
+        self.feature(r)
+        excludes = os.path.join(r.tmp, ".gitignore")
+        with open(excludes, "w") as fh:
+            fh.write("data/\n")
+        r.git("config", "--global", "core.excludesFile", excludes)
+        self.force_add(r, "data/rows.csv")
+
+        self.assertEqual(self.forbid(r).returncode, 0)
+
+    def test_a_non_ascii_ignored_path_is_reported_raw(self):
+        r = Repo(self)
+        self.feature(r)
+        self.ignore_data(r)
+        self.force_add(r, "data/Kundenliste_Müller.csv")
+
+        res = self.forbid(r)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("  x gitignored: data/Kundenliste_Müller.csv (", res.stdout)
+
+    def test_a_rename_onto_an_ignored_name_is_refused(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("kept.csv", "name\n")
+        r.commit_all("kept")
+        r.git("push", "-q", "origin", "feature", "--no-verify")
+        self.ignore_data(r)
+        os.makedirs(os.path.join(r.root, "data"))
+        r.git("mv", "kept.csv", "data/rows.csv")
+        r.git("commit", "-qm", "move")
+
+        res = self.forbid(r, env={"TURNSTILE_RANGE": "origin/feature..HEAD"})
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("  x gitignored: data/rows.csv (", res.stdout)
+
+    def test_a_gitignore_the_push_itself_adds_applies(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write(".gitignore", "data/\n")
+        r.write("data/rows.csv", "name\n")
+        r.git("add", "-f", ".gitignore", "data/rows.csv")
+        r.git("commit", "-qm", "both")
+
+        res = self.forbid(r)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("  x gitignored: data/rows.csv (", res.stdout)
+        self.assertNotIn(".gitignore (", res.stdout)
+
+    def test_a_nested_gitignore_applies_to_its_own_directory(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("export/.gitignore", "*.csv\n")
+        r.write("export/rows.csv", "name\n")
+        r.write("rows.csv", "name\n")
+        r.git("add", "-f", "export/.gitignore", "export/rows.csv", "rows.csv")
+        r.git("commit", "-qm", "nested")
+
+        res = self.forbid(r)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertEqual(res.stdout.splitlines()[0].split(" (")[0], "  x gitignored: export/rows.csv")
+        self.assertIn("scan: 1 gitignored path(s) added", res.stdout)
+
+    def test_a_negated_pattern_does_not_ignore(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write(".gitignore", "data/*\n!data/keep.csv\n")
+        r.git("add", ".gitignore")
+        r.git("commit", "-qm", "ignore")
+        self.force_add(r, "data/keep.csv")
+
+        self.assertEqual(self.forbid(r).returncode, 0)
+
+    def test_a_clean_merge_of_the_default_branch_is_not_charged_but_the_own_add_is(self):
+        r = Repo(self)
+        self.feature(r)
+        r.git("switch", "-q", "main")
+        self.ignore_data(r)
+        self.force_add(r, "data/upstream.csv", "upstream export")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "feature")
+        r.git("merge", "-q", "origin/main", "-m", "merge main")
+
+        merged = self.forbid(r)
+        sha = self.force_add(r, "data/mine.csv")
+        own = self.forbid(r)
+
+        self.assertEqual(merged.returncode, 0, merged.stderr)
+        self.assertEqual(merged.stdout, "")
+        self.assertEqual(own.returncode, 1, own.stderr)
+        self.assertIn(f"  x gitignored: data/mine.csv ({sha})", own.stdout)
+        self.assertNotIn("upstream.csv", own.stdout)
+
+    def test_a_clean_merge_is_not_charged_without_remerge_diff_either(self):
+        r = Repo(self)
+        self.feature(r)
+        r.git("switch", "-q", "main")
+        self.ignore_data(r)
+        self.force_add(r, "data/upstream.csv", "upstream export")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "feature")
+        r.git("merge", "-q", "origin/main", "-m", "merge main")
+
+        res = self.forbid(r, env={**self.RANGE, "TURNSTILE_FORCE_CC": "1"})
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_an_ignored_file_only_the_merge_commit_adds_is_refused(self):
+        r = Repo(self)
+        self.feature(r)
+        r.git("switch", "-q", "main")
+        r.write("upstream.txt", "x\n")
+        r.commit_all("upstream work")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "feature")
+        self.ignore_data(r)
+        r.git("merge", "-q", "--no-commit", "--no-ff", "origin/main")
+        r.write("data/slipped.csv", "name\n")
+        r.git("add", "-f", "data/slipped.csv")
+        r.git("commit", "-qm", "merge main")
+
+        res = self.forbid(r)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("  x gitignored: data/slipped.csv (", res.stdout)
+
+    def test_a_path_beyond_a_symlink_is_skipped_with_a_warning_and_the_scan_goes_on(self):
+        r = Repo(self)
+        self.feature(r)
+        self.ignore_data(r)
+        r.write("d/file", "x\n")
+        r.commit_all("a directory")
+        sha = self.force_add(r, "data/rows.csv")
+        shutil.rmtree(os.path.join(r.root, "d"))
+        os.symlink(r.tmp, os.path.join(r.root, "d"))
+        r.commit_all("a symlink instead")
+
+        res = self.forbid(r)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn(f"  x gitignored: data/rows.csv ({sha})", res.stdout)
+        self.assertIn("! turnstile: could not judge d/file", res.stderr)
+        self.assertNotIn("d/file", res.stdout)
+
+    def test_a_relative_excludes_file_named_gitignore_that_is_not_tracked_is_not_refused(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("other/.gitignore", "other/\n")
+        r.write("personal/.gitignore", "data/\n")
+        r.git("config", "core.excludesFile", "personal/.gitignore")
+        r.write(".gitignore", "other/\n")
+        r.git("add", ".gitignore")
+        r.git("commit", "-qm", "ignore other")
+        self.force_add(r, "data/rows.csv")
+        sha = self.force_add(r, "other/rows.csv")
+
+        res = self.forbid(r)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertEqual(res.stdout.splitlines(),
+                         [f"  x gitignored: other/rows.csv ({sha})", "scan: 1 gitignored path(s) added"])
+
+    def test_findings_are_counted_by_path_not_by_output_line(self):
+        r = Repo(self)
+        self.feature(r)
+        self.ignore_data(r)
+        r.write("data/a b.csv", "x\n")
+        r.write("data/new\n  x line.csv", "x\n")
+        r.git("add", "-f", "data")
+        r.git("commit", "-qm", "odd names")
+
+        res = self.forbid(r)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertEqual(res.stdout.splitlines()[-1], "scan: 2 gitignored path(s) added")
+
+    def test_a_push_adding_nothing_ignored_is_silent(self):
+        r = Repo(self)
+        self.feature(r)
+        self.ignore_data(r)
+        r.write("src/a.txt", "x\n")
+        r.commit_all("source")
+
+        res = self.forbid(r)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_an_unknown_option_and_a_missing_mode_flag_exit_two(self):
+        r = Repo(self)
+
+        bad_option = self.scan(r, "--bogus")
+        no_mode = self.scan(r)
+
+        self.assertEqual(bad_option.returncode, 2)
+        self.assertIn("unknown option for scan paths: --bogus", bad_option.stderr)
+        self.assertEqual(no_mode.returncode, 2)
+        self.assertIn("--forbid-gitignored", no_mode.stderr)
+
+    def test_help_prints_usage(self):
+        res = self.scan(Repo(self), "--help")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("turnstile scan paths --forbid-gitignored", res.stderr)
+
+    def test_a_range_naming_an_unknown_revision_exits_two(self):
+        res = self.forbid(Repo(self), env={"TURNSTILE_RANGE": "origin/main..nonexistent"})
+
+        self.assertEqual(res.returncode, 2)
+
+    def test_the_worktree_gate_refuses_an_uncommitted_force_add(self):
+        r = Repo(self)
+        self.ignore_data(r)
+        r.config(f"paths: {TURNSTILE} scan paths --forbid-gitignored\n")
+        r.commit_all("config")
+        r.write("data/rows.csv", "name\n")
+        r.git("add", "-f", "data/rows.csv")
+
+        res = r.turnstile("run", "--no-ai", "--no-cache")
+
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("x gitignored: data/rows.csv (uncommitted)", res.stdout + res.stderr)
+
+    def test_an_untracked_ignored_file_in_the_worktree_is_not_refused(self):
+        r = Repo(self)
+        self.ignore_data(r)
+        r.write("data/rows.csv", "name\n")
+
+        res = self.forbid(r, env={})
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+
 class MissingConfigWarning(unittest.TestCase):
     WARNING = "tracks a .turnstile this push does not carry - its checks did not run"
 
