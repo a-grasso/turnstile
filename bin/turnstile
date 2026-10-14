@@ -228,9 +228,12 @@ compute_ranges() {
 # The remote branch the change was cut from, not always the default one: a
 # branch off `develop` diffed against `main` drags every unreleased commit into
 # the review. Nearest wins, measured as commits between fork point and head;
-# ties go to origin/HEAD, then origin/main and origin/master.
+# ties go to origin/HEAD, then origin/main and origin/master. A head the
+# default branch already holds is an empty range; one only some other branch
+# holds is still unreviewed.
 default_base() {
-  local head="$1" nearest refs
+  local head="$1" nearest refs default contained
+  default="$(default_branch_ref || true)"
   # One git call, not two per remote branch: with sixty renovate branches the
   # loop below costs ten seconds, on every agent turn.
   if refs="$(git for-each-ref --format="%(refname) %(ahead-behind:$head)" \
@@ -241,21 +244,26 @@ default_base() {
         print $3, p, $1
       }' <<<"$refs" | sort -n -k1,1 -k2,2 | head -n1 | cut -d' ' -f3)"
     if [ -n "$nearest" ] && git merge-base "$nearest" "$head" 2>/dev/null; then return 0; fi
+    if [ -n "$default" ]; then
+      contained="$(awk -v ref="refs/remotes/$default" '$1 == ref && $3 == 0 { print $1 }' <<<"$refs")"
+      if [ -n "$contained" ]; then printf '%s' "$head"; return 0; fi
+    fi
     printf '%s' "$EMPTY_TREE"
     return 0
   fi
-  default_base_per_branch "$head"
+  default_base_per_branch "$head" "$default"
 }
 
 # git before 2.41 has no %(ahead-behind).
 default_base_per_branch() {
-  local head="$1" b mb ahead best="" best_ahead=""
+  local head="$1" default="${2:-}" b mb ahead best="" best_ahead="" contained=""
   while IFS= read -r b; do
     mb="$(git merge-base "$b" "$head" 2>/dev/null)" || continue
     ahead="$(git rev-list --count "$mb..$head" 2>/dev/null)" || continue
-    # Zero means head is already on that branch: an empty range and a gate
-    # that silently checks nothing.
-    [ "$ahead" -gt 0 ] || continue
+    if [ "$ahead" -eq 0 ]; then
+      [ -n "$default" ] && [ "$b" = "$default" ] && contained=1
+      continue
+    fi
     if [ -z "$best" ] || [ "$ahead" -lt "$best_ahead" ]; then
       best="$mb"; best_ahead="$ahead"
     fi
@@ -266,7 +274,23 @@ default_base_per_branch() {
     git for-each-ref --format='%(refname:short)' refs/remotes | grep -v '/HEAD$'
     printf '%s\n' main master
   )
-  printf '%s' "${best:-$EMPTY_TREE}"
+  if [ -n "$best" ]; then printf '%s' "$best"
+  elif [ -n "$contained" ]; then printf '%s' "$head"
+  else printf '%s' "$EMPTY_TREE"
+  fi
+}
+
+# The branch a pull request to the remote would land on, as a remote-tracking
+# ref; fails when the remote names none.
+default_branch_ref() {
+  local remote="${1:-origin}" ref
+  if ref="$(git symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" 2>/dev/null)" && [ -n "$ref" ]; then
+    printf '%s' "$ref"; return 0
+  fi
+  for ref in "$remote/main" "$remote/master"; do
+    if git rev-parse --verify --quiet "refs/remotes/$ref" >/dev/null 2>&1; then printf '%s' "$ref"; return 0; fi
+  done
+  return 1
 }
 
 # ---------------------------------------------------------------- the change
@@ -296,9 +320,9 @@ snapshot_tree() { GIT_INDEX_FILE="$SNAPSHOT" git write-tree; }
 # Push mode reads the pushed range, which is what actually leaves the machine.
 change_diff() {
   if [ "$TURNSTILE_MODE" = worktree ]; then
-    GIT_INDEX_FILE="$SNAPSHOT" git diff --cached "$@"
+    GIT_INDEX_FILE="$SNAPSHOT" git -c core.quotePath=false diff --cached "$@"
   else
-    git diff "$@"
+    git -c core.quotePath=false diff "$@"
   fi
 }
 
@@ -472,7 +496,7 @@ run_checks() {
     rm -f "$SNAPSHOT"; SNAPSHOT="$fresh"
     tree_after="$(cd "$root" && snapshot_tree)"
     [ "$tree_after" != "$tree_before" ] \
-      && rewritten="$(git -C "$root" diff-tree -r --name-only "$tree_before" "$tree_after")"
+      && rewritten="$(git -C "$root" -c core.quotePath=false diff-tree -r --name-only "$tree_before" "$tree_after")"
   fi
 
   local -a summary=()
@@ -634,7 +658,7 @@ cmd_pre_push() {
   # Every pushed ref is gated, in its own pass. Rare enough that the repeated
   # deterministic checks do not matter, and the AI cache means an identical
   # diff across two refs is not paid for twice.
-  local failures=0 i degraded=0 unrunnable=0 unapproved=0
+  local failures=0 i degraded=0 unrunnable=0 unapproved=0 warned_missing=0 default
   for i in "${!ranges[@]}"; do
     TURNSTILE_MODE=push
     TURNSTILE_RANGE="${ranges[$i]}"
@@ -645,6 +669,11 @@ cmd_pre_push() {
 
     local in_place=1
     if [ ! -f "$root/$CONFIG_NAME" ] && ! git cat-file -e "${shas[$i]}:$CONFIG_NAME" 2>/dev/null; then
+      if [ "$warned_missing" -eq 0 ] && default="$(default_branch_ref "${1:-origin}")" \
+          && git cat-file -e "$default:$CONFIG_NAME" 2>/dev/null; then
+        warn "turnstile: $default tracks a $CONFIG_NAME this push does not carry - its checks did not run"
+        warned_missing=1
+      fi
       gate_ref "$label"
     elif [ "$(cd "$root" && working_tree)" != "$(git rev-parse "${shas[$i]}^{tree}" 2>/dev/null)" ]; then
       in_place=0
@@ -701,22 +730,23 @@ cmd_pre_push_public() {
 }
 
 cmd_run() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-ai)    TURNSTILE_NO_AI=1 ;;
+      --no-cache) TURNSTILE_NO_CACHE=1 ;;
+      --stop)     TURNSTILE_NO_AI=1 TURNSTILE_AT_STOP=1 ;;
+      -h|--help)  usage; return 0 ;;
+      *)          die "unknown option for run: $1" ;;
+    esac
+    shift
+  done
+
   local root; root="$(repo_root)" || die "not inside a git repository"
 
   if ! config_approved; then
     say "$UNAPPROVED_MESSAGE"
     return 1
   fi
-
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --no-ai)    TURNSTILE_NO_AI=1 ;;
-      --no-cache) TURNSTILE_NO_CACHE=1 ;;
-      --stop)     TURNSTILE_NO_AI=1 TURNSTILE_AT_STOP=1 ;;
-      *)          die "unknown option for run: $1" ;;
-    esac
-    shift
-  done
 
   # The same base a push would use, so a tree that passes here is a cache hit
   # there. The working tree is what gets checked, committed or not.
@@ -768,6 +798,7 @@ cmd_ci() {
     case "$1" in
       --base)   base="${2:-}"; shift ;;
       --base=*) base="${1#--base=}" ;;
+      -h|--help) usage; return 0 ;;
       *)        die "unknown option for ci: $1" ;;
     esac
     shift
@@ -859,7 +890,16 @@ cmd_uninstall_repo() {
 }
 
 cmd_install() {
-  if [ "${1:-}" = "--repo" ]; then cmd_install_repo; return; fi
+  local repo=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)       repo=1 ;;
+      -h|--help)    usage; return 0 ;;
+      *)            die "unknown option for install: $1" ;;
+    esac
+    shift
+  done
+  if [ "$repo" -eq 1 ]; then cmd_install_repo; return; fi
   local dispatch="$TURNSTILE_HOME/hooks/dispatch"
   [ -x "$dispatch" ] || die "missing or non-executable: $dispatch"
 
@@ -897,7 +937,16 @@ cmd_install() {
 }
 
 cmd_uninstall() {
-  if [ "${1:-}" = "--repo" ]; then cmd_uninstall_repo; return; fi
+  local repo=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)       repo=1 ;;
+      -h|--help)    usage; return 0 ;;
+      *)            die "unknown option for uninstall: $1" ;;
+    esac
+    shift
+  done
+  if [ "$repo" -eq 1 ]; then cmd_uninstall_repo; return; fi
   local current
   current="$(git config --global --get core.hooksPath || true)"
   if [ "$current" = "$HOOKS_INSTALL_DIR" ]; then
