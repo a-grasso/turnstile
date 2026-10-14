@@ -1712,6 +1712,554 @@ class OptionHandling(unittest.TestCase):
                 self.assertIn("Usage", res.stderr)
 
 
+class PushScope(unittest.TestCase):
+    RANGE = {"TURNSTILE_RANGE": "origin/main..HEAD"}
+
+    def files(self, r: Repo, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run([TURNSTILE, "files", *args], cwd=r.root, env={**r.env, **(env or {})},
+                              capture_output=True, text=True)
+
+    def listed(self, r: Repo, *args: str, env: dict | None = None) -> list[str]:
+        res = self.files(r, *args, env=self.RANGE if env is None else env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout.splitlines()
+
+    def feature(self, r: Repo) -> None:
+        r.git("switch", "-q", "-c", "feature")
+
+    def land_on_main(self, r: Repo, rel: str) -> None:
+        r.git("switch", "-q", "main")
+        r.write(rel, "landed on main\n")
+        r.commit_all("upstream work")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "feature")
+
+    def test_files_of_every_pushed_commit_are_listed_once(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("src/A.kt", "one\n")
+        r.write("README.md", "one\n")
+        r.commit_all("first")
+        r.write("src/A.kt", "two\n")
+        r.write("docs/b.md", "two\n")
+        r.commit_all("second")
+
+        names = self.listed(r)
+
+        self.assertEqual(sorted(names), ["README.md", "docs/b.md", "src/A.kt"])
+
+    def test_a_file_added_and_deleted_within_the_push_is_not_listed(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("scratch.txt", "temporary\n")
+        r.write("keep.txt", "kept\n")
+        r.commit_all("first")
+        os.remove(os.path.join(r.root, "scratch.txt"))
+        r.commit_all("second")
+
+        self.assertEqual(self.listed(r), ["keep.txt"])
+
+    def test_a_non_ascii_path_is_printed_raw(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("Kundenliste_Müller.csv", "name\n")
+        r.commit_all("customers")
+
+        self.assertEqual(self.listed(r), ["Kundenliste_Müller.csv"])
+
+    def test_dash_zero_separates_names_with_nul(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("Kundenliste_Müller.csv", "name\n")
+        r.write("with space.txt", "x\n")
+        r.commit_all("odd names")
+
+        res = self.files(r, "-0", env=self.RANGE)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(res.stdout.endswith("\0"))
+        self.assertEqual(sorted(res.stdout.split("\0")[:-1]),
+                         ["Kundenliste_Müller.csv", "with space.txt"])
+
+    def test_glob_filters_to_matching_files_at_any_depth(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("src/main/A.kt", "x\n")
+        r.write("B.kt", "x\n")
+        r.write("README.md", "x\n")
+        r.commit_all("kotlin")
+
+        names = self.listed(r, "--glob", "**/*.kt")
+
+        self.assertEqual(sorted(names), ["B.kt", "src/main/A.kt"])
+
+    def test_glob_is_repeatable(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("src/A.kt", "x\n")
+        r.write("docs/a.md", "x\n")
+        r.write("other.txt", "x\n")
+        r.commit_all("mixed")
+
+        names = self.listed(r, "--glob", "**/*.kt", "--glob", "**/*.md")
+
+        self.assertEqual(sorted(names), ["docs/a.md", "src/A.kt"])
+
+    def test_a_new_ref_whose_tip_is_already_on_the_default_branch_lists_nothing(self):
+        r = Repo(self)
+        seen = os.path.join(r.tmp, "seen")
+        r.config(f"probe: {TURNSTILE} files > {seen}\n")
+        r.commit_all("config")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        head = r.git("rev-parse", "HEAD").strip()
+
+        res = r.turnstile("__pre-push", "origin",
+                          stdin=f"refs/heads/copy {head} refs/heads/copy {'0' * 40}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(seen) as fh:
+            self.assertEqual(fh.read(), "")
+
+    def test_a_range_from_the_empty_tree_lists_only_what_the_default_branch_lacks(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("feature.txt", "x\n")
+        r.commit_all("feature")
+        empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+        names = self.listed(r, env={"TURNSTILE_RANGE": f"{empty_tree}..HEAD"})
+
+        self.assertEqual(names, ["feature.txt"])
+
+    def test_a_clean_merge_of_the_default_branch_contributes_no_files(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("feature.txt", "x\n")
+        r.commit_all("feature")
+        self.land_on_main(r, "upstream.txt")
+        r.git("merge", "-q", "origin/main", "-m", "merge main")
+
+        self.assertEqual(self.listed(r), ["feature.txt"])
+
+    def test_a_clean_merge_contributes_no_files_without_remerge_diff_too(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("feature.txt", "x\n")
+        r.commit_all("feature")
+        self.land_on_main(r, "upstream.txt")
+        r.git("merge", "-q", "origin/main", "-m", "merge main")
+
+        names = self.listed(r, env={**self.RANGE, "TURNSTILE_FORCE_CC": "1"})
+
+        self.assertEqual(names, ["feature.txt"])
+
+    def test_a_file_only_the_merge_commit_adds_is_listed(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("feature.txt", "x\n")
+        r.commit_all("feature")
+        self.land_on_main(r, "upstream.txt")
+        r.git("merge", "-q", "--no-commit", "--no-ff", "origin/main")
+        r.write("evil.txt", "slipped into the merge\n")
+        r.commit_all("merge main")
+
+        self.assertEqual(sorted(self.listed(r)), ["evil.txt", "feature.txt"])
+
+    def test_worktree_mode_does_not_list_what_a_merged_in_default_branch_brought(self):
+        r = Repo(self)
+        fork = r.git("rev-parse", "origin/main").strip()
+        self.feature(r)
+        r.write("feature.txt", "x\n")
+        r.commit_all("feature")
+        self.land_on_main(r, "upstream.txt")
+        r.git("merge", "-q", "origin/main", "-m", "merge main")
+        r.write("untracked.txt", "x\n")
+
+        names = self.listed(r, env={"TURNSTILE_MODE": "worktree", "TURNSTILE_RANGE": f"{fork}..HEAD"})
+
+        self.assertEqual(sorted(names), ["feature.txt", "untracked.txt"])
+
+    def test_without_perl_it_exits_two_naming_it(self):
+        r = Repo(self)
+        bare = os.path.join(r.tmp, "bare-bin")
+        os.makedirs(bare)
+        os.symlink(shutil.which("dirname"), os.path.join(bare, "dirname"))
+
+        res = subprocess.run([shutil.which("bash"), TURNSTILE, "files"], cwd=r.root, capture_output=True,
+                             text=True, env={**r.env, **self.RANGE, "PATH": bare})
+
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertEqual(res.stdout, "")
+        self.assertIn("perl", res.stderr)
+
+    def second_remote(self, r: Repo) -> None:
+        upstream = os.path.join(r.tmp, "upstream.git")
+        subprocess.run(["git", "init", "-q", "--bare", upstream], env=r.env, check=True)
+        r.git("remote", "add", "upstream", upstream)
+
+    def test_the_default_branch_of_the_pushed_to_remote_is_excluded(self):
+        r = Repo(self)
+        self.second_remote(r)
+        r.write("only-upstream.txt", "x\n")
+        r.commit_all("held by upstream only")
+        r.git("push", "-q", "upstream", "main", "--no-verify")
+        r.git("reset", "-q", "--keep", "origin/main")
+        r.git("switch", "-q", "-c", "feature", "upstream/main")
+        r.write("feature.txt", "x\n")
+        r.commit_all("feature")
+        env = {"TURNSTILE_RANGE": "origin/main..HEAD"}
+
+        to_origin = self.listed(r, env=env)
+        to_upstream = self.listed(r, env={**env, "TURNSTILE_REMOTE": "upstream"})
+
+        self.assertEqual(sorted(to_origin), ["feature.txt", "only-upstream.txt"])
+        self.assertEqual(to_upstream, ["feature.txt"])
+
+    def test_pre_push_tells_checks_which_remote_it_is_pushing_to(self):
+        r = Repo(self)
+        self.second_remote(r)
+        seen = os.path.join(r.tmp, "seen")
+        r.config(f'probe: printf "%s" "$TURNSTILE_REMOTE" > {seen}\n')
+        r.commit_all("config")
+        head = r.git("rev-parse", "HEAD").strip()
+
+        res = r.turnstile("__pre-push", "upstream",
+                          stdin=f"refs/heads/main {head} refs/heads/main {'0' * 40}\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(seen) as fh:
+            self.assertEqual(fh.read(), "upstream")
+
+    def test_a_local_default_branch_excludes_its_commits_when_the_remote_has_none(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("feature.txt", "x\n")
+        r.commit_all("feature")
+        r.git("update-ref", "-d", "refs/remotes/origin/main")
+        empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+        names = self.listed(r, env={"TURNSTILE_RANGE": f"{empty_tree}..HEAD"})
+
+        self.assertEqual(names, ["feature.txt"])
+
+    def test_a_three_dot_range_starts_at_the_merge_base(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("feature.txt", "x\n")
+        r.commit_all("feature")
+        self.land_on_main(r, "upstream.txt")
+        for mode in ("push", "worktree"):
+            with self.subTest(mode=mode):
+                names = self.listed(r, env={"TURNSTILE_MODE": mode, "TURNSTILE_RANGE": "main...HEAD"})
+
+                self.assertEqual(names, ["feature.txt"])
+
+    def test_a_bare_range_means_push_mode_and_ignores_the_working_tree(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("committed.txt", "x\n")
+        r.commit_all("committed")
+        r.write("committed.txt", "edited\n")
+        r.write("untracked.txt", "x\n")
+
+        self.assertEqual(self.listed(r, env=self.RANGE), ["committed.txt"])
+
+    def test_worktree_mode_lists_committed_uncommitted_and_untracked_files(self):
+        r = Repo(self)
+        seen = os.path.join(r.tmp, "seen")
+        r.config(f"probe: {TURNSTILE} files > {seen}\n")
+        r.write("committed.txt", "x\n")
+        r.commit_all("committed")
+        r.write("a.txt", "edited\n")
+        r.write("untracked.txt", "x\n")
+
+        res = r.turnstile("run", "--no-ai")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(seen) as fh:
+            self.assertEqual(sorted(fh.read().split()),
+                             [".turnstile", "a.txt", "committed.txt", "untracked.txt"])
+
+    def test_worktree_is_the_default_mode_outside_a_run(self):
+        r = Repo(self)
+        r.write("committed.txt", "x\n")
+        r.commit_all("committed")
+        r.write("untracked.txt", "x\n")
+
+        res = self.files(r, env={})
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(sorted(res.stdout.split()), ["committed.txt", "untracked.txt"])
+
+    def test_worktree_mode_does_not_list_a_file_deleted_from_disk(self):
+        r = Repo(self)
+        os.remove(os.path.join(r.root, "a.txt"))
+        r.write("b.txt", "x\n")
+
+        res = self.files(r, env={"TURNSTILE_MODE": "worktree"})
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.split(), ["b.txt"])
+
+    def test_a_range_naming_an_unknown_revision_exits_two(self):
+        r = Repo(self)
+        for rng in ("bogus..HEAD", "origin/main..bogus"):
+            with self.subTest(range=rng):
+                res = self.files(r, env={"TURNSTILE_RANGE": rng})
+
+                self.assertEqual(res.returncode, 2, res.stderr)
+                self.assertEqual(res.stdout, "")
+
+    def test_an_unknown_option_is_refused(self):
+        res = self.files(Repo(self), "--bogus")
+
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("unknown option for files: --bogus", res.stderr)
+
+    def test_help_prints_usage(self):
+        res = self.files(Repo(self), "--help")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("turnstile files", res.stderr)
+
+
+class ScanMatch(unittest.TestCase):
+    PATTERN = "forbid\x1fFORBIDDEN_[A-Z]+"
+    LEAK = "FORBIDDEN_TOKEN"
+
+    def scan(self, diff: str, patterns: str | None = None, **env: str) -> subprocess.CompletedProcess:
+        base = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "TURNSTILE_", "TS_"))}
+        return subprocess.run([TURNSTILE, "__scan-match"], input=diff, capture_output=True, text=True,
+                              env={**base, "TS_PATTERNS": patterns or self.PATTERN,
+                                   "TS_CONTEXT": "abc1234", **env})
+
+    def assertReports(self, res: subprocess.CompletedProcess, *lines: str) -> None:
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertEqual(res.stdout.splitlines(), [f"  x forbid: {line} (abc1234)" for line in lines])
+        self.assertNotIn(self.LEAK, res.stdout + res.stderr)
+
+    def test_an_added_line_is_reported_with_its_new_file_line_number(self):
+        res = self.scan(textwrap.dedent(f"""\
+            diff --git a/src/app.py b/src/app.py
+            index 111..222 100644
+            --- a/src/app.py
+            +++ b/src/app.py
+            @@ -10,2 +10,3 @@ def f():
+             keep
+            +safe = 1
+            +leak = "{self.LEAK}"
+            """))
+
+        self.assertReports(res, "src/app.py:12")
+
+    def test_removed_and_context_lines_are_not_reported(self):
+        res = self.scan(textwrap.dedent(f"""\
+            diff --git a/a.txt b/a.txt
+            --- a/a.txt
+            +++ b/a.txt
+            @@ -1,3 +1,2 @@
+             {self.LEAK}
+            -{self.LEAK}
+             tail
+            """))
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_the_path_follows_each_file_and_the_line_number_each_hunk(self):
+        res = self.scan(textwrap.dedent(f"""\
+            diff --git a/one.txt b/one.txt
+            --- a/one.txt
+            +++ b/one.txt
+            @@ -0,0 +1 @@
+            +{self.LEAK}
+            diff --git a/two.txt b/two.txt
+            --- a/two.txt
+            +++ b/two.txt
+            @@ -4,0 +5,2 @@
+            +fine
+            +{self.LEAK}
+            @@ -20 +22 @@
+            -old
+            +{self.LEAK}
+            """))
+
+        self.assertReports(res, "one.txt:1", "two.txt:6", "two.txt:22")
+
+    def test_an_added_line_that_looks_like_a_file_header_stays_an_added_line(self):
+        res = self.scan(textwrap.dedent(f"""\
+            diff --git a/real.txt b/real.txt
+            --- a/real.txt
+            +++ b/real.txt
+            @@ -0,0 +1,2 @@
+            +first
+            +++ b/fake.txt {self.LEAK}
+            """))
+
+        self.assertReports(res, "real.txt:2")
+
+    def test_a_renamed_file_is_reported_under_its_new_path(self):
+        res = self.scan(textwrap.dedent(f"""\
+            diff --git a/old.txt b/new.txt
+            similarity index 90%
+            rename from old.txt
+            rename to new.txt
+            --- a/old.txt
+            +++ b/new.txt
+            @@ -1 +1,2 @@
+             x
+            +{self.LEAK}
+            """))
+
+        self.assertReports(res, "new.txt:2")
+
+    def test_a_path_with_a_trailing_tab_and_spaces_is_reported_whole(self):
+        res = self.scan(f"diff --git a/we ird.txt b/we ird.txt\n--- a/we ird.txt\t\n"
+                        f"+++ b/we ird.txt\t\n@@ -0,0 +1 @@\n+{self.LEAK}\n")
+
+        self.assertReports(res, "we ird.txt:1")
+
+    def test_every_matching_pattern_is_reported_for_a_line(self):
+        res = self.scan(f"+++ b/a.txt\n@@ -0,0 +1 @@\n+{self.LEAK} and more\n",
+                        patterns="first\x1fFORBIDDEN\x1esecond\x1fmore$")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertEqual(res.stdout.splitlines(),
+                         ["  x first: a.txt:1 (abc1234)", "  x second: a.txt:1 (abc1234)"])
+
+    def test_a_diff_with_no_match_exits_zero_silently(self):
+        res = self.scan("+++ b/a.txt\n@@ -0,0 +1 @@\n+fine\n")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_a_pattern_that_does_not_compile_exits_two_naming_it(self):
+        res = self.scan("+++ b/a.txt\n@@ -0,0 +1 @@\n+fine\n", patterns="broken\x1f(")
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("bad pattern broken", res.stderr)
+
+    def test_plain_input_is_every_line_of_the_named_file(self):
+        res = self.scan(f"fine\n{self.LEAK}\n", TS_PLAIN="1", TS_PATH="notes.txt")
+
+        self.assertReports(res, "notes.txt:2")
+
+    def test_only_lines_every_parent_lacks_count_as_added_by_a_merge(self):
+        res = self.scan(textwrap.dedent(f"""\
+            diff --cc app.py
+            index 111,222..333
+            --- a/app.py
+            +++ b/app.py
+            @@@ -1,2 -1,2 +1,4 @@@
+              ctx
+             +from one parent {self.LEAK}
+            + from the other parent {self.LEAK}
+            ++added by the merge {self.LEAK}
+             -gone
+            """))
+
+        self.assertReports(res, "app.py:4")
+
+    def test_a_combined_diff_without_file_headers_takes_the_path_from_diff_cc(self):
+        res = self.scan(f"diff --cc dir/app.py\nindex 111,222..333\n@@@ -1 -1 +1 @@@\n++{self.LEAK}\n")
+
+        self.assertReports(res, "dir/app.py:1")
+
+    def test_three_parent_combined_lines_need_all_three_columns_added(self):
+        res = self.scan(textwrap.dedent(f"""\
+            diff --combined app.py
+            --- a/app.py
+            +++ b/app.py
+            @@@@ -1 -1 -1 +1,2 @@@@
+            ++ two of three {self.LEAK}
+            +++all three {self.LEAK}
+            """))
+
+        self.assertReports(res, "app.py:2")
+
+
+    def test_a_quoted_path_with_an_escaped_tab_is_reported_unescaped(self):
+        res = self.scan(textwrap.dedent(f"""\
+            diff --git "a/tab\\tname.txt" "b/tab\\tname.txt"
+            --- "a/tab\\tname.txt"
+            +++ "b/tab\\tname.txt"
+            @@ -0,0 +1 @@
+            +{self.LEAK}
+            """))
+
+        self.assertReports(res, "tab\tname.txt:1")
+
+    def test_a_quoted_header_is_never_attributed_to_the_previous_file(self):
+        res = self.scan(textwrap.dedent(f"""\
+            diff --git a/one.txt b/one.txt
+            --- a/one.txt
+            +++ b/one.txt
+            @@ -0,0 +1 @@
+            +fine
+            diff --git "a/q\\"x.txt" "b/q\\"x.txt"
+            new file mode 100644
+            @@ -0,0 +1 @@
+            +{self.LEAK}
+            """))
+
+        self.assertReports(res, 'q"x.txt:1')
+
+    def test_a_file_whose_path_is_unknown_is_not_given_the_previous_files_name(self):
+        res = self.scan(textwrap.dedent(f"""\
+            diff --git a/one.txt b/one.txt
+            --- a/one.txt
+            +++ b/one.txt
+            @@ -0,0 +1 @@
+            +fine
+            diff --git a/old name.txt b/new name.txt
+            @@ -0,0 +1 @@
+            +{self.LEAK}
+            """))
+
+        self.assertReports(res, "(unknown):1")
+
+
+class ScanWorktree(unittest.TestCase):
+    def scan(self, r: Repo, **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run([TURNSTILE, "__scan-worktree"], cwd=r.root, capture_output=True, text=True,
+                              env={**r.env, "TS_PATTERNS": "forbid\x1fFORBIDDEN_[A-Z]+", **env})
+
+    def dirty(self, r: Repo) -> None:
+        r.write("a.txt", "a\nFORBIDDEN_TOKEN\n")
+        r.write("fresh.txt", "fine\nFORBIDDEN_TOKEN\n")
+
+    def test_uncommitted_and_untracked_additions_are_scanned_in_worktree_mode(self):
+        r = Repo(self)
+        self.dirty(r)
+
+        res = self.scan(r)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertEqual(sorted(res.stdout.splitlines()),
+                         ["  x forbid: a.txt:2 (uncommitted)", "  x forbid: fresh.txt:2 (untracked)"])
+        self.assertNotIn("FORBIDDEN_TOKEN", res.stdout + res.stderr)
+
+    def test_the_working_tree_is_not_scanned_in_push_mode(self):
+        r = Repo(self)
+        self.dirty(r)
+
+        res = self.scan(r, TURNSTILE_RANGE="origin/main..HEAD")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_ignored_files_are_not_scanned(self):
+        r = Repo(self)
+        r.write(".gitignore", "ignored.txt\n")
+        r.commit_all("ignore")
+        r.write("ignored.txt", "FORBIDDEN_TOKEN\n")
+
+        res = self.scan(r)
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+
 class MissingConfigWarning(unittest.TestCase):
     WARNING = "tracks a .turnstile this push does not carry - its checks did not run"
 

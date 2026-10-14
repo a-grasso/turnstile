@@ -411,7 +411,7 @@ run_checks() {
   TURNSTILE_CHANGED_FILES="$(cd "$root" && changed_names)"
   TURNSTILE_DIFF_FILE="$logdir/change.diff"
   (cd "$root" && change_patch) >"$TURNSTILE_DIFF_FILE"
-  export TURNSTILE_BASE TURNSTILE_RANGE TURNSTILE_CHANGED_FILES TURNSTILE_DIFF_FILE
+  export TURNSTILE_MODE TURNSTILE_REMOTE TURNSTILE_BASE TURNSTILE_RANGE TURNSTILE_CHANGED_FILES TURNSTILE_DIFF_FILE
 
   say ""
   say "${C_BOLD}turnstile${C_RESET} ${C_DIM}${label}${C_RESET}"
@@ -661,6 +661,7 @@ cmd_pre_push() {
   local failures=0 i degraded=0 unrunnable=0 unapproved=0 warned_missing=0 default
   for i in "${!ranges[@]}"; do
     TURNSTILE_MODE=push
+    [ -n "${1:-}" ] && TURNSTILE_REMOTE="$1"
     TURNSTILE_RANGE="${ranges[$i]}"
     TURNSTILE_BASE="$(git rev-parse "${TURNSTILE_RANGE%%..*}")"
 
@@ -729,6 +730,14 @@ cmd_pre_push_public() {
   cmd_pre_push "$@"
 }
 
+worktree_base() {
+  local base
+  if ! base="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"; then
+    base="$(default_base HEAD)"
+  fi
+  git merge-base "$base" HEAD 2>/dev/null || git rev-parse "$base"
+}
+
 cmd_run() {
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -750,14 +759,8 @@ cmd_run() {
 
   # The same base a push would use, so a tree that passes here is a cache hit
   # there. The working tree is what gets checked, committed or not.
-  local upstream base
-  if upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"; then
-    base="$upstream"
-  else
-    base="$(default_base HEAD)"
-  fi
   TURNSTILE_MODE=worktree
-  TURNSTILE_BASE="$(git merge-base "$base" HEAD 2>/dev/null || git rev-parse "$base")"
+  TURNSTILE_BASE="$(worktree_base)"
   TURNSTILE_RANGE="${TURNSTILE_BASE}..HEAD"
 
   local label="manual run"
@@ -822,6 +825,327 @@ cmd_ci() {
   local failures=$?
   rm -f "$CONFIG_OVERRIDE"
   verdict "$failures" "this change fails the checks of $base"
+}
+
+# ---------------------------------------------------------------- push scope
+
+# A range diff bills a push for merged-in default-branch commits, so the scope is measured per pushed commit.
+
+SCOPE_MODE="" SCOPE_BASE="" SCOPE_TIP="" REMERGE_OK=""
+
+scope_fail() { printf '%sx %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 2; }
+
+require_perl() {
+  command -v perl >/dev/null 2>&1 || scope_fail "perl is not on PATH, which turnstile files and the diff scan need"
+}
+
+# The missing-config warning needs the remote's own default branch, so the local fallback lives here.
+scope_default_ref() {
+  local ref
+  default_branch_ref "${TURNSTILE_REMOTE:-origin}" && return 0
+  for ref in main master; do
+    if git rev-parse --verify --quiet "refs/heads/$ref" >/dev/null 2>&1; then printf '%s' "$ref"; return 0; fi
+  done
+  return 1
+}
+
+is_commit() { git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1; }
+
+scope_resolve() {
+  if [ -n "${TURNSTILE_MODE:-}" ]; then SCOPE_MODE="$TURNSTILE_MODE"
+  elif [ -n "${TURNSTILE_RANGE:-}" ]; then SCOPE_MODE=push
+  else SCOPE_MODE=worktree
+  fi
+
+  if [ -n "${TURNSTILE_RANGE:-}" ]; then
+    case "$TURNSTILE_RANGE" in
+      *...*)
+        SCOPE_BASE="${TURNSTILE_RANGE%%...*}"
+        SCOPE_TIP="${TURNSTILE_RANGE##*...}"
+        [ -n "$SCOPE_BASE" ] || SCOPE_BASE=HEAD
+        [ -n "$SCOPE_TIP" ] || SCOPE_TIP=HEAD
+        SCOPE_BASE="$(git merge-base "$SCOPE_BASE" "$SCOPE_TIP")" \
+          || scope_fail "no merge base for TURNSTILE_RANGE $TURNSTILE_RANGE"
+        ;;
+      *..*)
+        SCOPE_BASE="${TURNSTILE_RANGE%%..*}"
+        SCOPE_TIP="${TURNSTILE_RANGE##*..}"
+        [ -n "$SCOPE_TIP" ] || SCOPE_TIP=HEAD
+        ;;
+      *) scope_fail "TURNSTILE_RANGE is not a range: $TURNSTILE_RANGE" ;;
+    esac
+  else
+    SCOPE_BASE="$(worktree_base)" || scope_fail "could not resolve the base of the change"
+    SCOPE_TIP=HEAD
+  fi
+
+  SCOPE_TIP="$(git rev-parse --verify --quiet "$SCOPE_TIP^{commit}")" \
+    || scope_fail "unknown revision in the push scope: ${SCOPE_TIP}"
+
+  local resolved fork default
+  if resolved="$(git rev-parse --verify --quiet "$SCOPE_BASE^{commit}")"; then
+    SCOPE_BASE="$resolved"
+  elif resolved="$(git rev-parse --verify --quiet "$SCOPE_BASE^{tree}")"; then
+    SCOPE_BASE="$resolved"
+    if default="$(scope_default_ref)" \
+        && fork="$(git merge-base "$default" "$SCOPE_TIP" 2>/dev/null)"; then
+      SCOPE_BASE="$fork"
+    fi
+  else
+    scope_fail "unknown base in the push scope: $SCOPE_BASE"
+  fi
+
+  probe_remerge
+}
+
+# Probed up front: a lazily set cache would die with the pipeline subshell that set it.
+probe_remerge() {
+  REMERGE_OK=0
+  [ -z "${TURNSTILE_FORCE_CC:-}" ] || return 0
+  if git log -n0 --remerge-diff --format= --all >/dev/null 2>&1; then REMERGE_OK=1; fi
+}
+
+# Fails closed: a scan that saw no commits would read as clean. Prints "<sha> <parent count>" per commit.
+pushed_commits() {
+  local -a excludes=()
+  local default listing
+  if default="$(scope_default_ref)"; then excludes+=("^$default"); fi
+  if is_commit "$SCOPE_BASE"; then excludes+=("^$SCOPE_BASE"); fi
+  listing="$(git rev-list --parents "$SCOPE_TIP" ${excludes[@]+"${excludes[@]}"})" \
+    || scope_fail "could not enumerate pushed commits"
+  printf '%s\n' "$listing" | awk 'NF { print $1, NF - 1 }'
+}
+
+SCAN_DIFF_OPTS=(--no-color --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/)
+
+# A merge is diffed against a re-merge of its parents so the commits it brings in are not billed to it.
+commit_scan_diff() {
+  local sha="$1" parents="$2" mode=--cc
+  if [ "$parents" -gt 1 ]; then
+    [ "$REMERGE_OK" = 1 ] && mode=--remerge-diff
+    git -c core.quotePath=false show "$mode" --format= --no-show-signature "${SCAN_DIFF_OPTS[@]}" "$sha"
+  else
+    git -c core.quotePath=false show --format= --no-show-signature -U0 "${SCAN_DIFF_OPTS[@]}" "$sha"
+  fi
+}
+
+# Reports "id: path:line", never the line, so a secret that trips it is not copied into logs.
+IFS= read -r -d '' SCAN_MATCH_PERL <<'PERL' || true
+use strict;
+use warnings;
+
+my @patterns;
+for my $record (split /\x1e/, $ENV{TS_PATTERNS} // '') {
+    next if $record eq '';
+    my ($id, $source) = split /\x1f/, $record, 2;
+    my $regex;
+    $regex = eval { qr/$source/ } if defined $source && length $source;
+    if (!$regex) {
+        print STDERR "bad pattern $id\n";
+        exit 2;
+    }
+    push @patterns, [$id, $regex];
+}
+
+my $context = $ENV{TS_CONTEXT} // '';
+my $found = 0;
+
+sub report {
+    my ($path, $line_no, $text) = @_;
+    for my $pattern (@patterns) {
+        my ($id, $regex) = @$pattern;
+        next unless $text =~ $regex;
+        print "  x $id: $path:$line_no ($context)\n";
+        $found = 1;
+    }
+}
+
+sub unescape {
+    my ($quoted) = @_;
+    my %escape = (t => "\t", n => "\n", '"' => '"', '\\' => '\\');
+    $quoted =~ s{\\(?:([0-7]{3})|(.))}{defined $1 ? chr(oct $1) : ($escape{$2} // $2)}gse;
+    return $quoted;
+}
+
+sub unquote_path {
+    my ($path) = @_;
+    $path =~ s/\t.*\z//s;
+    return $path unless $path =~ /\A"(.*)"\z/s;
+    return unescape($1);
+}
+
+sub new_path {
+    my $path = unquote_path($_[0]);
+    return undef if $path eq '/dev/null';
+    $path =~ s{\Ab/}{};
+    return $path;
+}
+
+sub git_header_path {
+    my ($names) = @_;
+    return unescape($1) if $names =~ m{ "b/((?:[^"\\]|\\.)*)"\z}s;
+    return $1 if $names =~ m{\A"a/(?:[^"\\]|\\.)*" b/(.+)\z}s;
+    return $1 if $names =~ m{\Aa/(.+) b/(.+)\z}s && $1 eq $2;
+    return undef;
+}
+
+if ($ENV{TS_PLAIN}) {
+    my $path = $ENV{TS_PATH} // '';
+    while (my $line = <STDIN>) {
+        chomp $line;
+        report($path, $., $line);
+    }
+    exit $found;
+}
+
+my ($file, $line_no, $columns, $in_hunk, $old_left, $new_left) = (undef, 0, 0, 0, 0, 0);
+
+while (my $line = <STDIN>) {
+    chomp $line;
+
+    if ($line =~ /\A(@@+) (.*?) \1/) {
+        my ($marks, $ranges) = ($1, $2);
+        $columns = length($marks) - 1;
+        my ($new_start, $new_count) = $ranges =~ /\+(\d+)(?:,(\d+))?/;
+        my ($old_count) = $ranges =~ /-\d+(?:,(\d+))?/;
+        ($line_no, $new_left, $old_left) = ($new_start, $new_count // 1, $old_count // 1);
+        $in_hunk = 1;
+        next;
+    }
+
+    if ($in_hunk && $line !~ /\Adiff /) {
+        next if $line =~ /\A\\/;
+        my $where = $file // '(unknown)';
+        if ($columns == 1) {
+            my $tag = substr($line, 0, 1);
+            if ($tag eq '+') {
+                report($where, $line_no, substr($line, 1));
+                $line_no++;
+                $new_left--;
+            } elsif ($tag eq ' ' || $tag eq '') {
+                $line_no++;
+                $old_left--;
+                $new_left--;
+            } elsif ($tag eq '-') {
+                $old_left--;
+            }
+            $in_hunk = 0 if $old_left <= 0 && $new_left <= 0;
+        } elsif (length($line) >= $columns) {
+            my $tags = substr($line, 0, $columns);
+            report($where, $line_no, substr($line, $columns)) unless $tags =~ /[^+]/;
+            $line_no++ unless $tags =~ /-/;
+        }
+        next;
+    }
+    $in_hunk = 0;
+
+    if ($line =~ /\Adiff --(?:cc|combined) (.+)\z/) {
+        $file = unquote_path($1);
+    } elsif ($line =~ /\Adiff --git (.+)\z/) {
+        $file = git_header_path($1);
+    } elsif ($line =~ /\Adiff /) {
+        $file = undef;
+    } elsif ($line =~ /\A\+\+\+ (.*)\z/) {
+        $file = new_path($1);
+    } elsif ($line =~ /\A(?:rename|copy) to (.*)\z/) {
+        $file = unquote_path($1);
+    }
+}
+
+exit $found;
+PERL
+readonly SCAN_MATCH_PERL
+
+scan_match() {
+  require_perl
+  perl -e "$SCAN_MATCH_PERL"
+}
+
+# A push leaves the machine as committed, so only a worktree run has these.
+scan_worktree_extras() {
+  [ "$SCOPE_MODE" = worktree ] || return 0
+  local rc=0 path list
+  local -a status
+
+  git -c core.quotePath=false diff -U0 "${SCAN_DIFF_OPTS[@]}" HEAD | TS_CONTEXT=uncommitted scan_match
+  status=("${PIPESTATUS[@]}")
+  [ "${status[0]}" -eq 0 ] || return 2
+  case "${status[1]}" in 0) ;; 1) rc=1 ;; *) return 2 ;; esac
+
+  list="$(mktemp "${TMPDIR:-/tmp}/turnstile-untracked.XXXXXX")" || return 2
+  if ! git -c core.quotePath=false ls-files --others --exclude-standard -z >"$list"; then
+    rm -f "$list"
+    return 2
+  fi
+  while IFS= read -r -d '' path; do
+    [ -f "$path" ] && [ ! -L "$path" ] || continue
+    TS_PLAIN=1 TS_PATH="$path" TS_CONTEXT=untracked scan_match <"$path"
+    case $? in 0) ;; 1) rc=1 ;; *) rc=2; break ;; esac
+  done <"$list"
+  rm -f "$list"
+  return $rc
+}
+
+files_collect() {
+  local sha parents commits
+  local -a merge
+  commits="$(pushed_commits)" || return 2
+  while read -r sha parents; do
+    [ -n "$sha" ] || continue
+    merge=()
+    if [ "$parents" -gt 1 ]; then
+      if [ "$REMERGE_OK" = 1 ]; then merge=(--remerge-diff); else merge=(-c); fi
+    fi
+    git -c core.quotePath=false diff-tree -r -z --root --name-only --diff-filter=d --format= \
+      ${merge[@]+"${merge[@]}"} "$sha" -- "$@" || return 2
+  done <<<"$commits"
+
+  [ "$SCOPE_MODE" = worktree ] || return 0
+  git -c core.quotePath=false diff --name-only -z --diff-filter=d HEAD -- "$@" || return 2
+  git -c core.quotePath=false ls-files --others --exclude-standard -z -- "$@" || return 2
+}
+
+# A file the push added and later deleted must not be listed.
+files_existing() {
+  local terminator="$1" path
+  perl -0ne 'print unless $seen{$_}++' | while IFS= read -r -d '' path; do
+    if [ "$SCOPE_MODE" = worktree ]; then
+      [ -e "$path" ] || [ -L "$path" ] || continue
+    else
+      git cat-file -e "$SCOPE_TIP:$path" 2>/dev/null </dev/null || continue
+    fi
+    printf "%s$terminator" "$path"
+  done
+}
+
+cmd_files() {
+  require_perl
+  local terminator='\n' g raw rc
+  local -a globs=() specs=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --glob)    [ -n "${2:-}" ] || die "files needs a pattern after --glob"; globs+=("$2"); shift ;;
+      --glob=*)  globs+=("${1#--glob=}") ;;
+      -0)        terminator='\0' ;;
+      -h|--help) usage; return 0 ;;
+      *)         die "unknown option for files: $1" ;;
+    esac
+    shift
+  done
+  local root; root="$(repo_root)" || die "not inside a git repository"
+  cd "$root" || exit 2
+  scope_resolve
+  for g in "${globs[@]+"${globs[@]}"}"; do specs+=(":(glob)$g"); done
+
+  raw="$(mktemp "${TMPDIR:-/tmp}/turnstile-files.XXXXXX")" || exit 2
+  if ! files_collect "${specs[@]+"${specs[@]}"}" >"$raw"; then
+    rm -f "$raw"
+    exit 2
+  fi
+  files_existing "$terminator" <"$raw"
+  rc=$?
+  rm -f "$raw"
+  [ "$rc" -eq 0 ] || exit 2
 }
 
 # The working tree as one hash, untracked files included. For the Stop hook,
@@ -1066,6 +1390,13 @@ cmd_doctor() {
     problems=$((problems + 1))
   fi
 
+  if command -v perl >/dev/null 2>&1; then
+    say "  ${C_GREEN}✓${C_RESET} perl on PATH"
+  else
+    say "  ${C_RED}✗${C_RESET} perl not on PATH - turnstile files and the diff scan cannot run"
+    problems=$((problems + 1))
+  fi
+
   # The AI half is only a problem when a repo actually asked for it. A machine
   # that only ever runs deterministic checks should not be told it is broken
   # for lacking a `claude` binary it will never invoke.
@@ -1116,6 +1447,7 @@ usage() {
                            --stop      what an agent's turn end runs: no ai, no push-only checks
     turnstile ci --base <ref>
                            CI: deterministic checks only, no cache, config read from <ref>
+    turnstile files [--glob G] [-0]   changed files of the push that still exist
     turnstile ai [args]    run just the ai modules (see: turnstile ai --help)
     turnstile hook claude-stop
                            Claude Code Stop hook: reads the payload on stdin
@@ -1147,6 +1479,10 @@ case "${1:-}" in
   status)      cmd_status ;;
   run)         shift; cmd_run "$@" ;;
   ci)          shift; cmd_ci "$@" ;;
+  files)       shift; cmd_files "$@" ;;
+  # Internal: they make the matcher and the worktree scan testable on their own.
+  __scan-match) scan_match ;;
+  __scan-worktree) cd "$(repo_root)" && scope_resolve && scan_worktree_extras ;;
   ai)          shift; exec "$AI_RUNNER" "$@" ;;
   hook)        shift; cmd_hook "$@" ;;
   print-claude-settings) cmd_print_claude_settings ;;

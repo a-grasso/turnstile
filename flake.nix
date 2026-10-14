@@ -34,6 +34,7 @@
                 pkgs.bash
                 pkgs.git
                 pkgs.python3
+                pkgs.perl
                 pkgs.coreutils
                 pkgs.gawk
                 pkgs.gnused
