@@ -1837,7 +1837,7 @@ usage() {
     turnstile scan added --forbid REGEX [--since-base]   refuse added lines matching REGEX (PCRE)
     turnstile scan added --forbid-secrets                builtin secret patterns, per pushed commit
     turnstile scan added --kaibo-checks                  kaibo binding forbid_regex checks over added lines
-    turnstile scan paths --forbid-gitignored        refuse pushed paths the tracked .gitignore ignores
+    turnstile scan paths --forbid-gitignored             refuse pushed paths the tracked .gitignore ignores
     turnstile ai [args]    run just the ai modules (see: turnstile ai --help)
     turnstile hook claude-stop
                            Claude Code Stop hook: reads the payload on stdin
