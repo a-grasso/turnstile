@@ -9,7 +9,7 @@
 
 set -uo pipefail
 
-TURNSTILE_VERSION="0.2.0-prototype"
+TURNSTILE_VERSION="0.2.0"
 
 # ---------------------------------------------------------------- paths
 

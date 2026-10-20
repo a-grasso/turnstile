@@ -30,7 +30,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.2.0-prototype"
+VERSION = "0.2.0"
 
 # Bumped when the prompt contract or finding shape changes, so a cache written
 # by an older runner is never replayed against newer semantics.
