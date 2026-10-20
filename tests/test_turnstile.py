@@ -2127,6 +2127,36 @@ class ScanMatch(unittest.TestCase):
         self.assertEqual(res.stdout.splitlines(),
                          ["  x first: a.txt:1 (abc1234)", "  x second: a.txt:1 (abc1234)"])
 
+    def test_a_commit_separator_switches_the_context_of_what_follows(self):
+        sha = "1234567890abcdef1234567890abcdef12345678"
+        res = self.scan(f"+++ b/a.txt\n@@ -0,0 +1 @@\n+{self.LEAK}\n"
+                        f"turnstile-commit: {sha}\n"
+                        f"+++ b/b.txt\n@@ -0,0 +1 @@\n+{self.LEAK}\n")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertEqual(res.stdout.splitlines(),
+                         ["  x forbid: a.txt:1 (abc1234)", "  x forbid: b.txt:1 (1234567)"])
+
+    def test_a_separator_closes_a_combined_hunk_left_open(self):
+        sha = "1234567890abcdef1234567890abcdef12345678"
+        res = self.scan(f"diff --cc a.txt\n@@@ -1 -1 +1 @@@\n  ctx\n"
+                        f"turnstile-commit: {sha}\n"
+                        f"+++ b/b.txt\n@@ -0,0 +1 @@\n+{self.LEAK}\n")
+
+        self.assertEqual(res.stdout.splitlines(), ["  x forbid: b.txt:1 (1234567)"])
+
+    def test_a_trailing_carriage_return_does_not_defeat_an_end_anchor(self):
+        res = self.scan("+++ b/a.txt\n@@ -0,0 +1 @@\n+TODO\r\n", patterns="todo\x1fTODO$")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertEqual(res.stdout.splitlines(), ["  x todo: a.txt:1 (abc1234)"])
+
+    def test_plain_input_with_a_nul_in_its_head_is_skipped(self):
+        res = self.scan(f"\0{self.LEAK}\n", TS_PLAIN="1", TS_PATH="blob.bin")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
     def test_a_diff_with_no_match_exits_zero_silently(self):
         res = self.scan("+++ b/a.txt\n@@ -0,0 +1 @@\n+fine\n")
 
@@ -2258,6 +2288,427 @@ class ScanWorktree(unittest.TestCase):
 
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(res.stdout, "")
+
+
+class ScanAdded(unittest.TestCase):
+    RANGE = {"TURNSTILE_RANGE": "origin/main..HEAD"}
+    AWS_KEY = "AKIA" + "IOSFODNN7EXAMPLE"
+    EM_DASH = "\u2014"
+
+    def scan(self, r: Repo, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run([TURNSTILE, "scan", "added", *args], cwd=r.root,
+                              env={**r.env, **(self.RANGE if env is None else env)},
+                              capture_output=True, text=True)
+
+    def feature(self, r: Repo) -> None:
+        r.git("switch", "-q", "-c", "feature")
+
+    def land_on_main(self, r: Repo, rel: str, content: str) -> None:
+        r.git("switch", "-q", "main")
+        r.write(rel, content)
+        r.commit_all("upstream work")
+        r.git("push", "-q", "origin", "main", "--no-verify")
+        r.git("switch", "-q", "feature")
+
+    def assertSilentAbout(self, res: subprocess.CompletedProcess, *secrets: str) -> None:
+        for secret in secrets:
+            self.assertNotIn(secret, res.stdout + res.stderr)
+
+    def test_a_secret_added_and_removed_within_one_push_is_still_refused(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("config.env", f"KEY={self.AWS_KEY}\n")
+        r.commit_all("add key")
+        r.write("config.env", "KEY=\n")
+        r.commit_all("remove key")
+
+        res = self.scan(r, "--forbid-secrets")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("aws-access-key: config.env:1", res.stdout)
+        self.assertEqual(res.stdout.splitlines()[-1], "scan: 1 forbidden line(s) added")
+        self.assertSilentAbout(res, self.AWS_KEY)
+
+    def evil_merge(self, r: Repo) -> None:
+        self.feature(r)
+        r.write("feature.txt", "x\n")
+        r.commit_all("feature")
+        self.land_on_main(r, "upstream.txt", "landed\n")
+        r.git("merge", "-q", "--no-commit", "--no-ff", "origin/main")
+        r.write("evil.txt", f"KEY={self.AWS_KEY}\n")
+        r.commit_all("merge main")
+        os.remove(os.path.join(r.root, "evil.txt"))
+        r.commit_all("remove it again")
+
+    def test_a_secret_smuggled_into_a_merge_commit_is_refused(self):
+        r = Repo(self)
+        self.evil_merge(r)
+
+        for env in (self.RANGE, {**self.RANGE, "TURNSTILE_FORCE_CC": "1"}):
+            with self.subTest(env=env):
+                res = self.scan(r, "--forbid-secrets", env=env)
+
+                self.assertEqual(res.returncode, 1, res.stderr)
+                self.assertIn("aws-access-key: evil.txt:1", res.stdout)
+                self.assertSilentAbout(res, self.AWS_KEY)
+
+    def test_a_clean_merge_of_the_default_branch_is_not_charged_to_the_pusher(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("feature.txt", "fine\n")
+        r.commit_all("feature")
+        self.land_on_main(r, "upstream.txt", f"written {self.EM_DASH} upstream\n")
+        r.git("merge", "-q", "origin/main", "-m", "merge main")
+
+        for extra in ((), ("--since-base",)):
+            with self.subTest(extra=extra):
+                res = self.scan(r, "--forbid", "\\x{2014}", *extra)
+
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(res.stdout, "")
+
+    def test_a_line_added_and_reverted_is_caught_per_commit_but_not_against_the_base(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("notes.md", f"a {self.EM_DASH} b\n")
+        r.commit_all("add")
+        r.write("notes.md", "a, b\n")
+        r.commit_all("revert")
+
+        per_commit = self.scan(r, "--forbid", "\\x{2014}")
+        net = self.scan(r, "--forbid", "\\x{2014}", "--since-base")
+
+        self.assertEqual(per_commit.returncode, 1, per_commit.stderr)
+        self.assertIn("forbid: notes.md:1", per_commit.stdout)
+        self.assertEqual(net.returncode, 0, net.stderr)
+        self.assertEqual(net.stdout, "")
+
+    def test_since_base_reports_what_the_net_change_adds(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("notes.md", f"a {self.EM_DASH} b\n")
+        r.commit_all("add")
+
+        res = self.scan(r, "--forbid", "\\x{2014}", "--since-base")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("  x forbid: notes.md:1 (since-base)", res.stdout)
+
+    def test_each_builtin_secret_pattern_fires(self):
+        cases = {
+            "private-key": ("", "-----BEGIN RSA PRIVATE " + "KEY-----"),
+            "aws-access-key": ("id = ", "AKIA" + "IOSFODNN7EXAMPLE"),
+            "github-token": ("token: ", "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1"),
+            "gitlab-pat": ("token: ", "glpat-" + "abcdefghij0123456789"),
+            "atlassian-token": ("token: ", "ATATT" + "3xFfGF0abcdefghij0123456789"),
+            "slack-token": ("token: ", "xoxb" + "-1234567890-abcdef"),
+            "generic-sk-key": ("API_KEY=", "sk-" + "abcdefghijklmnop0123"),
+        }
+        for pattern_id, (prefix, secret) in cases.items():
+            with self.subTest(pattern=pattern_id):
+                r = Repo(self)
+                self.feature(r)
+                r.write("conf.txt", f"fine\n{prefix}{secret}\n")
+                r.commit_all("add")
+
+                res = self.scan(r, "--forbid-secrets")
+
+                self.assertEqual(res.returncode, 1, res.stderr)
+                self.assertIn(f"  x {pattern_id}: conf.txt:2 (", res.stdout)
+                self.assertSilentAbout(res, secret)
+
+    def test_a_hyphenated_word_ending_in_sk_is_not_a_secret(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("doc.txt", "churn-risk-assessment-for-existing-customers\n")
+        r.commit_all("add")
+
+        res = self.scan(r, "--forbid-secrets")
+
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_a_pattern_that_does_not_compile_exits_two(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("a.txt", "x\n")
+        r.commit_all("add")
+
+        res = self.scan(r, "--forbid", "(")
+
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("bad pattern", res.stderr)
+
+    def test_a_pattern_that_does_not_compile_exits_two_even_with_nothing_to_scan(self):
+        res = self.scan(Repo(self), "--forbid", "(")
+
+        self.assertEqual(res.returncode, 2, res.stderr)
+
+    def test_a_range_naming_an_unknown_revision_exits_two(self):
+        res = self.scan(Repo(self), "--forbid-secrets", env={"TURNSTILE_RANGE": "bogus..HEAD"})
+
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_only_a_range_in_the_environment_is_enough_for_a_manual_scan(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("config.env", f"KEY={self.AWS_KEY}\n")
+        r.commit_all("add key")
+        r.write("untracked.env", f"KEY={self.AWS_KEY}\n")
+
+        res = self.scan(r, "--forbid-secrets", env={"TURNSTILE_RANGE": "origin/main..HEAD"})
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("aws-access-key: config.env:1", res.stdout)
+        self.assertNotIn("untracked.env", res.stdout)
+
+    def test_the_worktree_gate_refuses_an_untracked_file_that_holds_the_pattern(self):
+        r = Repo(self)
+        r.config(f"added: {TURNSTILE} scan added --forbid FORBIDDEN_[A-Z]+\n")
+        r.commit_all("config")
+        r.write("fresh.txt", "FORBIDDEN_TOKEN\n")
+
+        res = r.turnstile("run", "--no-ai", "--no-cache")
+
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("added: exit 1, scan: 1 forbidden line(s) added", res.stdout + res.stderr)
+        self.assertSilentAbout(res, "FORBIDDEN_TOKEN")
+
+        os.remove(os.path.join(r.root, "fresh.txt"))
+        self.assertEqual(r.turnstile("run", "--no-ai", "--no-cache").returncode, 0)
+
+    def test_the_worktree_gate_refuses_an_uncommitted_edit_that_holds_the_pattern(self):
+        r = Repo(self)
+        r.config(f"added: {TURNSTILE} scan added --forbid FORBIDDEN_[A-Z]+\n")
+        r.commit_all("config")
+        r.write("a.txt", "a\nFORBIDDEN_TOKEN\n")
+
+        res = r.turnstile("run", "--no-ai", "--no-cache")
+
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("added: exit 1, scan: 1 forbidden line(s) added", res.stdout + res.stderr)
+
+        r.write("a.txt", "a\n")
+        self.assertEqual(r.turnstile("run", "--no-ai", "--no-cache").returncode, 0)
+
+    def test_since_base_also_scans_the_working_tree_in_worktree_mode(self):
+        r = Repo(self)
+        r.write("fresh.txt", "FORBIDDEN_TOKEN\n")
+
+        res = self.scan(r, "--forbid", "FORBIDDEN_[A-Z]+", "--since-base", env={})
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("  x forbid: fresh.txt:1 (untracked)", res.stdout)
+
+    def test_a_non_ascii_path_is_reported_raw(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("Kundenliste_Müller.csv", f"KEY={self.AWS_KEY}\n")
+        r.commit_all("customers")
+
+        res = self.scan(r, "--forbid-secrets")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("aws-access-key: Kundenliste_Müller.csv:1", res.stdout)
+        self.assertNotIn("\\303", res.stdout)
+
+    def test_since_base_without_a_default_branch_exits_two(self):
+        r = Repo(self)
+        r.git("switch", "-q", "--orphan", "lone")
+        r.write("a.txt", "x\n")
+        r.commit_all("lone")
+        r.git("branch", "-q", "-D", "main")
+        r.git("update-ref", "-d", "refs/remotes/origin/main")
+        empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+        res = self.scan(r, "--forbid", "x", "--since-base", env={"TURNSTILE_RANGE": f"{empty_tree}..HEAD"})
+
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("default branch", res.stderr)
+
+    def test_each_forbid_pattern_reports_under_its_own_id(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("a.txt", "alpha\nbeta\ngamma\n")
+        r.commit_all("add")
+
+        res = self.scan(r, "--forbid", "alpha", "--id", "first", "--forbid=beta", "--id=second",
+                        "--forbid", "gamma")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        lines = res.stdout.splitlines()
+        self.assertEqual([line.split(" (")[0] for line in lines[:-1]],
+                         ["  x first: a.txt:1", "  x second: a.txt:2", "  x forbid3: a.txt:3"])
+        self.assertEqual(lines[-1], "scan: 3 forbidden line(s) added")
+
+    def test_unnamed_forbid_patterns_get_distinct_ids(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("a.txt", "alpha\nbeta\n")
+        r.commit_all("add")
+
+        res = self.scan(r, "--forbid", "alpha", "--forbid", "beta")
+
+        self.assertEqual([line.split(" (")[0] for line in res.stdout.splitlines()[:-1]],
+                         ["  x forbid: a.txt:1", "  x forbid2: a.txt:2"])
+
+    def test_every_usage_error_exits_two_not_one(self):
+        r = Repo(self)
+        cases = [
+            ("scan", "added", "--forbid"),
+            ("scan", "added", "--forbid="),
+            ("scan", "added", "--forbid", "x", "--id="),
+            ("scan", "added", "--forbid", "x", "--bogus"),
+            ("scan", "nope"),
+            ("scan",),
+        ]
+        for args in cases:
+            with self.subTest(args=args):
+                res = r.turnstile(*args)
+
+                self.assertEqual(res.returncode, 2, res.stderr)
+                self.assertEqual(res.stdout, "")
+
+    def test_outside_a_repository_it_exits_two(self):
+        r = Repo(self)
+
+        res = subprocess.run([TURNSTILE, "scan", "added", "--forbid", "x"], cwd=r.tmp, env=r.env,
+                             capture_output=True, text=True)
+
+        self.assertEqual(res.returncode, 2, res.stderr)
+
+    def test_since_base_reads_paths_whatever_the_user_diff_config_says(self):
+        r = Repo(self)
+        r.git("config", "diff.noprefix", "true")
+        self.feature(r)
+        r.write("b/notes.md", f"a {self.EM_DASH} b\n")
+        r.commit_all("add")
+
+        res = self.scan(r, "--forbid", "\\x{2014}", "--since-base")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("  x forbid: b/notes.md:1 (since-base)", res.stdout)
+
+    def counting_perl(self, r: Repo) -> str:
+        log = os.path.join(r.tmp, "perl-runs")
+        r.fake("perl", f'#!/bin/sh\necho x >> {log}\nexec {shutil.which("perl")} "$@"\n')
+        return log
+
+    def test_a_scan_runs_one_matcher_however_many_commits_it_reads(self):
+        r = Repo(self)
+        log = self.counting_perl(r)
+        self.feature(r)
+        for n in range(3):
+            r.write(f"f{n}.txt", f"{n}\n")
+            r.commit_all(f"commit {n}")
+
+        res = self.scan(r, "--forbid", "nothing-matches-this")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(log) as fh:
+            self.assertEqual(len(fh.readlines()), 1)
+
+    def test_a_scan_of_no_commits_still_runs_the_matcher_once(self):
+        r = Repo(self)
+        log = self.counting_perl(r)
+
+        res = self.scan(r, "--forbid", "(")
+
+        self.assertEqual(res.returncode, 2, res.stderr)
+        with open(log) as fh:
+            self.assertEqual(len(fh.readlines()), 1)
+
+    def test_each_finding_carries_the_commit_that_added_it(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("one.txt", "FORBIDDEN_ONE\n")
+        r.commit_all("one")
+        first = r.git("rev-parse", "HEAD").strip()[:7]
+        r.write("two.txt", "fine\n")
+        r.commit_all("two")
+        r.write("three.txt", "FORBIDDEN_THREE\n")
+        r.commit_all("three")
+        third = r.git("rev-parse", "HEAD").strip()[:7]
+
+        res = self.scan(r, "--forbid", "FORBIDDEN_[A-Z]+")
+
+        self.assertEqual(sorted(res.stdout.splitlines()[:-1]),
+                         sorted([f"  x forbid: one.txt:1 ({first})", f"  x forbid: three.txt:1 ({third})"]))
+
+    def test_a_crlf_file_is_matched_as_if_it_had_unix_line_ends(self):
+        r = Repo(self)
+        self.feature(r)
+        r.write("win.txt", "fine\r\nTODO\r\n")
+        r.commit_all("crlf")
+
+        res = self.scan(r, "--forbid", "TODO$")
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("forbid: win.txt:2", res.stdout)
+
+    def test_an_untracked_binary_file_is_not_scanned(self):
+        r = Repo(self)
+        r.write("blob.bin", "\0FORBIDDEN_TOKEN\n")
+        r.write("text.txt", "fine\n")
+
+        res = self.scan(r, "--forbid", "FORBIDDEN_[A-Z]+", env={})
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_an_untracked_file_over_ten_megabytes_is_not_scanned(self):
+        r = Repo(self)
+        r.write("huge.log", "FORBIDDEN_TOKEN\n" + "a" * (10 * 1024 * 1024 + 1))
+
+        res = self.scan(r, "--forbid", "FORBIDDEN_[A-Z]+", env={})
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_a_pattern_id_that_collides_is_refused(self):
+        r = Repo(self)
+        cases = {
+            "named like an unnamed one": ("--forbid", "A", "--id", "forbid2", "--forbid", "B"),
+            "named twice": ("--forbid", "A", "--id", "x", "--forbid", "B", "--id", "x"),
+            "named like a builtin": ("--forbid", "A", "--id", "aws-access-key", "--forbid-secrets"),
+        }
+        for label, args in cases.items():
+            with self.subTest(label):
+                res = self.scan(r, *args)
+
+                self.assertEqual(res.returncode, 2, res.stderr)
+                self.assertIn("duplicate pattern id", res.stderr)
+
+    def test_without_a_pattern_source_it_refuses_and_says_how_to_give_one(self):
+        res = self.scan(Repo(self))
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("--forbid", res.stderr)
+        self.assertIn("--forbid-secrets", res.stderr)
+
+    def test_an_unknown_option_and_an_unknown_subcommand_are_refused(self):
+        r = Repo(self)
+
+        bad_option = self.scan(r, "--bogus")
+        bad_subcommand = r.turnstile("scan", "bogus")
+
+        self.assertEqual(bad_option.returncode, 2)
+        self.assertIn("unknown option for scan added: --bogus", bad_option.stderr)
+        self.assertEqual(bad_subcommand.returncode, 2)
+        self.assertIn("unknown scan subcommand: bogus", bad_subcommand.stderr)
+
+    def test_help_prints_usage(self):
+        res = Repo(self).turnstile("scan", "--help")
+
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("turnstile scan added", res.stderr)
+
+    def test_id_without_a_preceding_forbid_is_refused(self):
+        res = self.scan(Repo(self), "--id", "x", "--forbid", "y")
+
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("--id", res.stderr)
 
 
 class MissingConfigWarning(unittest.TestCase):
