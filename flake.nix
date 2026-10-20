@@ -17,7 +17,7 @@
       packages = forAllSystems (pkgs: {
         default = pkgs.stdenvNoCC.mkDerivation {
           pname = "turnstile";
-          version = "0.2.0-prototype";
+          version = "0.2.0";
           src = self;
 
           buildInputs = [
